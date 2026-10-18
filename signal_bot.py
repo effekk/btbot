@@ -6,7 +6,7 @@ trend yönünde ve üst zaman dilimiyle uyumlu bir sinyal bulursa Telegram'a gö
 Aynı sinyal ikinci kez gönderilmez (state.json).
 
 Ayarlar ortam değişkenlerinden okunur (.github/workflows/signal.yml içinde):
-  SYMBOLS, TIMEFRAME, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TEST_RUN
+  SYMBOLS, TIMEFRAMES, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TEST_RUN
 """
 import datetime
 import json
@@ -27,7 +27,8 @@ DEFAULT_SYMBOLS = ("BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT, DOGE_USDT,
                    "AVAX_USDT, LINK_USDT, DOT_USDT, LTC_USDT, TRX_USDT, SUI_USDT, NEAR_USDT, "
                    "APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, PEPE_USDT, SHIB_USDT")
 SYMBOLS = [s.strip().upper() for s in os.environ.get("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
-TIMEFRAME = os.environ.get("TIMEFRAME", "1h").strip()
+# Virgülle birden fazla zaman dilimi: her biri kendi mumu kapandığında taranır
+TIMEFRAMES = [t.strip() for t in os.environ.get("TIMEFRAMES", "15m, 1h").split(",") if t.strip()]
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TEST_RUN = os.environ.get("TEST_RUN", "").lower() == "true"
@@ -308,7 +309,18 @@ def alert_text(symbol, timeframe, a):
 # =========================================================================
 # Gate.io ve Telegram
 # =========================================================================
+_CACHE = {}
+
+
 def fetch_candles(symbol, interval, limit=CANDLE_LIMIT):
+    """Aynı çalıştırmada aynı veriyi iki kez çekmemek için önbellekli."""
+    key = (symbol, interval)
+    if key not in _CACHE:
+        _CACHE[key] = _fetch_candles(symbol, interval, CANDLE_LIMIT)
+    return _CACHE[key].copy()
+
+
+def _fetch_candles(symbol, interval, limit=CANDLE_LIMIT):
     """Gate.io herkese açık REST uç noktasından mum çeker (API anahtarı gerekmez)."""
     q = urllib.parse.urlencode({"currency_pair": symbol, "interval": interval, "limit": limit})
     req = urllib.request.Request(f"https://api.gateio.ws/api/v4/spot/candlesticks?{q}",
@@ -355,7 +367,7 @@ def load_state():
         with open(STATE_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"alerted": {}, "last_error_msg": 0}
+        return {"alerted": {}, "last_error_msg": 0, "last_scan": {}}
 
 
 def save_state(state):
@@ -368,65 +380,92 @@ def save_state(state):
 # =========================================================================
 # Ana akış
 # =========================================================================
-def main():
-    if TIMEFRAME not in INTERVAL_SECONDS:
-        print(f"Geçersiz TIMEFRAME: {TIMEFRAME}")
-        sys.exit(1)
+def last_closed_open_ts(timeframe, now):
+    """Son kapanmış mumun açılış zamanı (epoch saniye)."""
+    sec = INTERVAL_SECONDS[timeframe]
+    return int(now // sec * sec - sec)
 
-    state = load_state()
-    htf = HIGHER_TF.get(TIMEFRAME)
-    errors, report, sent = [], [], 0
 
+def scan_timeframe(timeframe, state, errors, report):
+    htf = HIGHER_TF.get(timeframe)
+    sent = 0
     for symbol in SYMBOLS:
         try:
-            df = fetch_candles(symbol, TIMEFRAME)
+            df = fetch_candles(symbol, timeframe)
             if len(df) < 40:
                 raise RuntimeError("yeterli mum yok")
             buy_src, sell_src = compute_signals(df)
 
             htf_trend = None
             if htf:
-                hdf = fetch_candles(symbol, htf, limit=120)
+                hdf = fetch_candles(symbol, htf)
                 if len(hdf) >= 40:
                     htf_trend, _ = market_state(hdf, len(hdf) - 2)
 
             trend, _ = market_state(df, len(df) - 2)
-            report.append(f"{symbol}: {trend} / {htf or '-'}: {htf_trend or '-'}")
+            report.append(f"{symbol} {timeframe}: {trend} / {htf or '-'}: {htf_trend or '-'}")
 
             alert = check_alert(df, buy_src, sell_src, htf_trend)
             if alert:
-                key = f"{symbol}|{TIMEFRAME}|{alert['time'].isoformat()}|{alert['side']}"
+                key = f"{symbol}|{timeframe}|{alert['time'].isoformat()}|{alert['side']}"
                 if key in state["alerted"]:
-                    print(f"{symbol}: sinyal daha önce gönderildi, atlandı")
-                elif send_telegram(alert_text(symbol, TIMEFRAME, alert)):
+                    print(f"{symbol} {timeframe}: sinyal daha önce gönderildi, atlandı")
+                elif send_telegram(alert_text(symbol, timeframe, alert)):
                     state["alerted"][key] = time.time()
                     sent += 1
-                    print(f"{symbol}: {alert['side']} sinyali gönderildi")
+                    print(f"{symbol} {timeframe}: {alert['side']} sinyali gönderildi")
             else:
-                print(f"{symbol}: alarm yok ({trend})")
+                print(f"{symbol} {timeframe}: alarm yok ({trend})")
         except Exception as e:
-            errors.append(f"{symbol}: {e}")
-            print(f"{symbol}: HATA – {e}")
-        time.sleep(0.2)
+            msg = f"{symbol} {timeframe}: {e}"
+            if msg not in errors:
+                errors.append(msg)
+            print(f"HATA – {msg}")
+        time.sleep(0.1)
+    return sent
+
+
+def main():
+    bad = [t for t in TIMEFRAMES if t not in INTERVAL_SECONDS]
+    if bad or not TIMEFRAMES:
+        print(f"Geçersiz TIMEFRAMES: {bad or TIMEFRAMES}")
+        sys.exit(1)
+
+    state = load_state()
+    state.setdefault("last_scan", {})
+    now_ts = time.time()
+    errors, report, sent, scanned = [], [], 0, []
+
+    for tf in TIMEFRAMES:
+        closed = last_closed_open_ts(tf, now_ts)
+        # Bu zaman diliminde yeni bir mum kapanmadıysa atla (test çalıştırmasında hepsi taranır)
+        if not TEST_RUN and state["last_scan"].get(tf, 0) >= closed:
+            print(f"{tf}: yeni mum kapanmadı, atlandı")
+            continue
+        n_err = len(errors)
+        sent += scan_timeframe(tf, state, errors, report)
+        scanned.append(tf)
+        if len(errors) - n_err < len(SYMBOLS):      # en az bir coin tarandıysa
+            state["last_scan"][tf] = closed
 
     now = datetime.datetime.now(TZ).strftime("%d.%m %H:%M")
+    total = len(SYMBOLS) * len(scanned)
     if TEST_RUN:
         msg = [f"✅ Test: sinyal botu çalışıyor ({now})",
-               f"Zaman dilimi: {TIMEFRAME} | {len(SYMBOLS) - len(errors)}/{len(SYMBOLS)} coin tarandı | "
-               f"{sent} sinyal gönderildi"]
+               f"Zaman dilimleri: {', '.join(scanned)} | {len(SYMBOLS)} coin | "
+               f"{total - len(errors)}/{total} tarama başarılı | {sent} sinyal gönderildi"]
         msg += ["", "Trendler:"] + report
         if errors:
             msg += ["", "Hatalar:"] + errors
         send_telegram("\n".join(msg))
     elif errors and time.time() - state.get("last_error_msg", 0) > 6 * 3600:
-        # Hata bildirimi en fazla 6 saatte bir
-        send_telegram(f"⚠️ Sinyal botu ({now}): {len(errors)}/{len(SYMBOLS)} coin taranamadı\n"
+        send_telegram(f"⚠️ Sinyal botu ({now}): {len(errors)}/{total} tarama başarısız\n"
                       + "\n".join(errors[:10]))
         state["last_error_msg"] = time.time()
 
     save_state(state)
-    print(f"Bitti: {len(SYMBOLS) - len(errors)} coin tarandı, {sent} sinyal, {len(errors)} hata")
-    if len(errors) == len(SYMBOLS):
+    print(f"Bitti: taranan {scanned}, {sent} sinyal, {len(errors)} hata")
+    if total and len(errors) == total:
         sys.exit(1)   # hepsi başarısızsa GitHub da e-posta ile haber verir
 
 
