@@ -5,17 +5,18 @@ on:
     # Her 15 dakikada bir, mum kapandıktan 2 dakika sonra.
     # 15m her seferinde, 1h sadece saat başı mum kapandığında taranır.
     # GitHub bazen birkaç dakika gecikmeyle çalıştırır.
-    - cron: "2,17,32,47 * * * *"
-  workflow_dispatch:   # "Run workflow" butonu: elle çalıştırınca test mesajı gönderir
-
-concurrency:
-  group: signal-bot
-  cancel-in-progress: false
+    - cron: "4,19,34,49 * * * *"   # yedek; asıl tetikleyici cron-job.org
+  workflow_dispatch:   # cron-job.org ve "Run workflow" butonu bunu kullanır
+    inputs:
+      test:
+        description: "Test mesajı gönder (trend listesi)"
+        type: boolean
+        default: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +38,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEST_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          TEST_RUN: ${{ inputs.test == true }}
           TIMEFRAMES: "15m, 1h"
           SYMBOLS: "BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT, DOGE_USDT, ADA_USDT, AVAX_USDT, LINK_USDT, DOT_USDT, LTC_USDT, TRX_USDT, SUI_USDT, NEAR_USDT, APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, PEPE_USDT, SHIB_USDT"
         run: python signal_bot.py
