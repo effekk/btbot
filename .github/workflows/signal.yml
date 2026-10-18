@@ -2,9 +2,10 @@ name: Sinyal Botu
 
 on:
   schedule:
-    # Her saat başı, mum kapandıktan 2 dakika sonra (saat UTC'dir, sorun değil)
+    # Her 15 dakikada bir, mum kapandıktan 2 dakika sonra.
+    # 15m her seferinde, 1h sadece saat başı mum kapandığında taranır.
     # GitHub bazen birkaç dakika gecikmeyle çalıştırır.
-    - cron: "2 * * * *"
+    - cron: "2,17,32,47 * * * *"
   workflow_dispatch:   # "Run workflow" butonu: elle çalıştırınca test mesajı gönderir
 
 concurrency:
@@ -37,7 +38,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_RUN: ${{ github.event_name == 'workflow_dispatch' }}
-          TIMEFRAME: "1h"
+          TIMEFRAMES: "15m, 1h"
           SYMBOLS: "BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT, DOGE_USDT, ADA_USDT, AVAX_USDT, LINK_USDT, DOT_USDT, LTC_USDT, TRX_USDT, SUI_USDT, NEAR_USDT, APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, PEPE_USDT, SHIB_USDT"
         run: python signal_bot.py
 
