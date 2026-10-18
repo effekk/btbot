@@ -1,0 +1,48 @@
+name: Sinyal Botu
+
+on:
+  schedule:
+    # Her saat başı, mum kapandıktan 2 dakika sonra (saat UTC'dir, sorun değil)
+    # GitHub bazen birkaç dakika gecikmeyle çalıştırır.
+    - cron: "2 * * * *"
+  workflow_dispatch:   # "Run workflow" butonu: elle çalıştırınca test mesajı gönderir
+
+concurrency:
+  group: signal-bot
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Daha önce gönderilen sinyallerin listesini geri yükle
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: signal-state-${{ github.run_id }}
+          restore-keys: signal-state-
+
+      - name: Tara
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          TIMEFRAME: "1h"
+          SYMBOLS: "BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT, DOGE_USDT, ADA_USDT, AVAX_USDT, LINK_USDT, DOT_USDT, LTC_USDT, TRX_USDT, SUI_USDT, NEAR_USDT, APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, PEPE_USDT, SHIB_USDT"
+        run: python signal_bot.py
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: signal-state-${{ github.run_id }}
