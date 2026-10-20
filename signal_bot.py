@@ -6,8 +6,7 @@ trend yönünde ve üst zaman dilimiyle uyumlu bir sinyal bulursa Telegram'a gö
 Aynı sinyal ikinci kez gönderilmez (state.json).
 
 Ayarlar ortam değişkenlerinden okunur (.github/workflows/signal.yml içinde):
-  SYMBOLS, TIMEFRAMES, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TEST_RUN,
-  TRADING_ENABLED, BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_BASE_URL
+  SYMBOLS, TIMEFRAMES, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TEST_RUN
 """
 import datetime
 import json
@@ -33,8 +32,6 @@ TIMEFRAMES = [t.strip() for t in os.environ.get("TIMEFRAMES", "15m, 1h").split("
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TEST_RUN = os.environ.get("TEST_RUN", "").lower() == "true"
-# "true" ise sinyalde Binance Futures'ta otomatik işlem açılır (binance_trader.py)
-TRADING_ENABLED = os.environ.get("TRADING_ENABLED", "").lower() == "true"
 TZ = ZoneInfo("Europe/Istanbul")      # mesajlardaki saatler Türkiye saati
 STATE_FILE = "state.json"
 
@@ -427,16 +424,6 @@ def last_closed_open_ts(timeframe, now):
     return int(now // sec * sec - sec)
 
 
-def try_trade(symbol, timeframe, alert):
-    import binance_trader
-    try:
-        opened, msg = binance_trader.open_trade(symbol, alert)
-    except Exception as e:
-        opened, msg = False, f"❌ {symbol} {timeframe}: işlem açılamadı – {e}"
-    print("  " + msg.replace("\n", " | "))
-    send_telegram(msg)
-
-
 def scan_timeframe(timeframe, state, errors, report):
     htf = HIGHER_TF.get(timeframe)
     sent = 0
@@ -465,8 +452,6 @@ def scan_timeframe(timeframe, state, errors, report):
                     state["alerted"][key] = time.time()
                     sent += 1
                     print(f"{symbol} {timeframe}: {alert['side']} sinyali gönderildi")
-                    if TRADING_ENABLED:
-                        try_trade(symbol, timeframe, alert)
             else:
                 print(f"{symbol} {timeframe}: alarm yok ({trend})")
         except Exception as e:
@@ -486,9 +471,6 @@ def main():
 
     state = load_state()
     state.setdefault("last_scan", {})
-    if TRADING_ENABLED:
-        import binance_trader
-        binance_trader.cleanup_orphan_orders()
     now_ts = time.time()
     errors, report, sent, scanned = [], [], 0, []
 
@@ -510,9 +492,6 @@ def main():
         msg = [f"✅ Test: sinyal botu çalışıyor ({now})",
                f"Zaman dilimleri: {', '.join(scanned)} | {len(SYMBOLS)} coin | "
                f"{total - len(errors)}/{total} tarama başarılı | {sent} sinyal gönderildi"]
-        if TRADING_ENABLED:
-            import binance_trader
-            msg += ["", binance_trader.status_line()]
         msg += ["", "Trendler:"] + report
         if errors:
             msg += ["", "Hatalar:"] + errors
