@@ -6,7 +6,8 @@ trend yönünde ve üst zaman dilimiyle uyumlu bir sinyal bulursa Telegram'a gö
 Aynı sinyal ikinci kez gönderilmez (state.json).
 
 Ayarlar ortam değişkenlerinden okunur (.github/workflows/signal.yml içinde):
-  SYMBOLS, TIMEFRAMES, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TEST_RUN
+  SYMBOLS, TIMEFRAMES, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TEST_RUN,
+  TRADING_ENABLED, BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_BASE_URL
 """
 import datetime
 import json
@@ -32,6 +33,8 @@ TIMEFRAMES = [t.strip() for t in os.environ.get("TIMEFRAMES", "15m, 1h").split("
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TEST_RUN = os.environ.get("TEST_RUN", "").lower() == "true"
+# "true" ise sinyalde Binance Futures'ta otomatik işlem açılır (binance_trader.py)
+TRADING_ENABLED = os.environ.get("TRADING_ENABLED", "").lower() == "true"
 TZ = ZoneInfo("Europe/Istanbul")      # mesajlardaki saatler Türkiye saati
 STATE_FILE = "state.json"
 
@@ -40,6 +43,10 @@ TREND_SOURCES = {"EMA", "MACD"}
 REVERSION_SOURCES = {"RSI", "BB"}
 MIN_INDICATORS = 1        # alarm için aynı mumda en az kaç indikatör tetiklenmeli
 STOP_LOOKBACK = 10        # stop seviyesi: son kaç kapanmış mumun dibi / tepesi
+ATR_PERIOD = 14           # ATR: bir mumun ortalama hareket genişliği (normal dalgalanma)
+STOP_BUFFER_ATR = 0.5     # stop, dibin/tepenin bu kadar ATR ötesine konur (fitile karşı pay)
+MIN_STOP_ATR = 1.0        # stop girişe en az bu kadar ATR uzak olmalı (daha yakınsa genişletilir)
+MAX_STOP_ATR = 4.0        # stop bundan uzaksa risk çok büyük: sinyal gönderilmez
 CANDLE_LIMIT = 200
 
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
@@ -139,6 +146,26 @@ def compute_indicators(df):
     df["bb_m"] = mb
     df["bb_u"] = ub
     df["bb_l"] = lb
+    df["atr"] = atr(df["high"].tolist(), df["low"].tolist(), closes, ATR_PERIOD)
+
+
+def atr(highs, lows, closes, period=14):
+    """Wilder ATR. İlk `period` mum için None."""
+    n = len(closes)
+    out = [None] * n
+    if n <= period:
+        return out
+    trs = [highs[0] - lows[0]]
+    for i in range(1, n):
+        trs.append(max(highs[i] - lows[i],
+                       abs(highs[i] - closes[i - 1]),
+                       abs(lows[i] - closes[i - 1])))
+    value = sum(trs[1:period + 1]) / period
+    out[period] = value
+    for i in range(period + 1, n):
+        value = (value * (period - 1) + trs[i]) / period
+        out[i] = value
+    return out
 
 
 def _v(x):
@@ -260,22 +287,34 @@ def check_alert(df, buy_src, sell_src, htf_trend, min_indicators=MIN_INDICATORS)
         return None
 
     entry = float(df["close"][i])
+    a = _v(df["atr"][i])
+    if a is None or a <= 0:
+        return None
     lo = max(0, i - STOP_LOOKBACK + 1)
+
+    # Stop: son STOP_LOOKBACK mumun dibi/tepesi + yarım ATR pay.
+    # Girişe 1 ATR'den yakınsa 1 ATR'ye genişletilir; 4 ATR'den uzaksa sinyal atlanır.
     if side == "AL":
-        stop = float(df["low"][lo:i + 1].min())
-        risk = entry - stop
+        swing = float(df["low"][lo:i + 1].min())
+        risk = max(entry - (swing - STOP_BUFFER_ATR * a), MIN_STOP_ATR * a)
+        stop = entry - risk
         target = entry + 2 * risk
     else:
-        stop = float(df["high"][lo:i + 1].max())
-        risk = stop - entry
+        swing = float(df["high"][lo:i + 1].max())
+        risk = max((swing + STOP_BUFFER_ATR * a) - entry, MIN_STOP_ATR * a)
+        stop = entry + risk
         target = entry - 2 * risk
-    if risk <= 0:
+    if risk > MAX_STOP_ATR * a:
+        print(f"  sinyal atlandı: stop çok uzak ({risk / a:.1f} ATR, %{risk / entry * 100:.2f})")
+        return None
+    if stop <= 0 or target <= 0:
         return None
 
     return {
         "side": side, "sources": src, "trend": trend, "htf_trend": htf_trend,
         "squeeze": squeeze, "time": df["datetime"][i], "entry": entry,
         "stop": stop, "target": target, "risk_pct": risk / entry * 100,
+        "atr_pct": a / entry * 100, "risk_atr": risk / a,
     }
 
 
@@ -296,8 +335,10 @@ def alert_text(symbol, timeframe, a):
         f"{(a['time'] + datetime.timedelta(seconds=INTERVAL_SECONDS[timeframe])).strftime('%d.%m %H:%M')})",
         f"Sinyal: {'+'.join(a['sources'])}",
         f"Trend {timeframe}: {a['trend']}" + (f" | {htf}: {a['htf_trend'] or '-'}" if htf else ""),
-        f"Stop: {fmt_price(a['stop'])} ({a['risk_pct']:.2f}%)",
-        f"Hedef (1:2): {fmt_price(a['target'])}",
+        f"🛑 SL: {fmt_price(a['stop'])} → zarar: -%{a['risk_pct']:.2f}",
+        f"🎯 TP (1:2): {fmt_price(a['target'])} → kâr: +%{2 * a['risk_pct']:.2f}",
+        f"Stop mesafesi: {a['risk_atr']:.1f} ATR (1 ATR = %{a['atr_pct']:.2f})",
+        "(yüzdeler sinyal fiyatından girildiğinde, kaldıraçsız)",
     ]
     if a["side"] == "SAT":
         lines.append("Not: spotta short açılamaz; elindekini satmak ya da vadeli hesap.")
@@ -386,6 +427,16 @@ def last_closed_open_ts(timeframe, now):
     return int(now // sec * sec - sec)
 
 
+def try_trade(symbol, timeframe, alert):
+    import binance_trader
+    try:
+        opened, msg = binance_trader.open_trade(symbol, alert)
+    except Exception as e:
+        opened, msg = False, f"❌ {symbol} {timeframe}: işlem açılamadı – {e}"
+    print("  " + msg.replace("\n", " | "))
+    send_telegram(msg)
+
+
 def scan_timeframe(timeframe, state, errors, report):
     htf = HIGHER_TF.get(timeframe)
     sent = 0
@@ -414,6 +465,8 @@ def scan_timeframe(timeframe, state, errors, report):
                     state["alerted"][key] = time.time()
                     sent += 1
                     print(f"{symbol} {timeframe}: {alert['side']} sinyali gönderildi")
+                    if TRADING_ENABLED:
+                        try_trade(symbol, timeframe, alert)
             else:
                 print(f"{symbol} {timeframe}: alarm yok ({trend})")
         except Exception as e:
@@ -433,6 +486,9 @@ def main():
 
     state = load_state()
     state.setdefault("last_scan", {})
+    if TRADING_ENABLED:
+        import binance_trader
+        binance_trader.cleanup_orphan_orders()
     now_ts = time.time()
     errors, report, sent, scanned = [], [], 0, []
 
@@ -454,6 +510,9 @@ def main():
         msg = [f"✅ Test: sinyal botu çalışıyor ({now})",
                f"Zaman dilimleri: {', '.join(scanned)} | {len(SYMBOLS)} coin | "
                f"{total - len(errors)}/{total} tarama başarılı | {sent} sinyal gönderildi"]
+        if TRADING_ENABLED:
+            import binance_trader
+            msg += ["", binance_trader.status_line()]
         msg += ["", "Trendler:"] + report
         if errors:
             msg += ["", "Hatalar:"] + errors
