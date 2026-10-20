@@ -39,11 +39,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_RUN: ${{ inputs.test == true }}
-          # Otomatik işlem: "true" açık, "false" sadece Telegram sinyali
-          TRADING_ENABLED: "true"
-          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
-          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
-          BINANCE_BASE_URL: "https://demo-fapi.binance.com"   # DEMO hesap
           TIMEFRAMES: "15m, 1h"
           SYMBOLS: "BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT, DOGE_USDT, ADA_USDT, AVAX_USDT, LINK_USDT, DOT_USDT, LTC_USDT, TRX_USDT, SUI_USDT, NEAR_USDT, APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, PEPE_USDT, SHIB_USDT"
         run: python signal_bot.py
