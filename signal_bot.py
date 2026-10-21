@@ -435,7 +435,7 @@ def last_closed_open_ts(timeframe, now):
 def try_trade(symbol, timeframe, alert):
     import binance_trader
     try:
-        opened, msg = binance_trader.open_trade(symbol, alert)
+        opened, msg = binance_trader.open_trade(symbol, alert, timeframe)
     except Exception as e:
         opened, msg = False, f"❌ {symbol} {timeframe}: işlem açılamadı – {e}"
     print("  " + msg.replace("\n", " | "))
