@@ -14,6 +14,7 @@ Ayarlar (ortam değişkenleri):
   BINANCE_API_KEY, BINANCE_API_SECRET   – GitHub Secrets
   BINANCE_BASE_URL                      – varsayılan demo: https://demo-fapi.binance.com
 """
+import datetime
 import hashlib
 import hmac
 import json
@@ -329,6 +330,56 @@ def _realized_since(symbol, start_ms):
         return None
 
 
+def _last_close_price(symbol, start_ms, close_side):
+    """Pozisyonu kapatan son işlemin fiyatı (çıkış türünü belirlemek için)."""
+    try:
+        rows = _request("GET", "/fapi/v1/userTrades", {"symbol": symbol, "startTime": int(start_ms), "limit": 100})
+        rows = [r for r in rows if r.get("side") == close_side]
+        return float(rows[-1]["price"]) if rows else None
+    except Exception:
+        return None
+
+
+def _record_close(symbol, plan, net, exit_type, notify):
+    """Kapanan işlemi rapor kaydına yazar; çıkış türünü (SL/TP/GİRİŞ/SÜRE/ELLE) belirler."""
+    entry = plan["entry"]
+    sl = plan.get("sl") or float(plan["sl_str"])
+    tp = float(plan["tp_str"])
+    risk = plan.get("risk_usdt") or plan["qty"] * abs(entry - sl)
+    partial = bool(plan.get("be_done") and plan.get("half", 0) > 0)
+    close_side = "SELL" if plan["side"] == "AL" else "BUY"
+    if exit_type is None:
+        px = _last_close_price(symbol, plan["opened_ms"] - 5000, close_side)
+        tol = 0.15 * abs(entry - sl)
+        if px is None:
+            exit_type = "?"
+        elif abs(px - tp) <= tol:
+            exit_type = "TP"
+        elif partial and abs(px - entry) <= tol:
+            exit_type = "GİRİŞ"
+        elif not partial and abs(px - sl) <= tol:
+            exit_type = "SL"
+        else:
+            exit_type = "ELLE"
+    try:
+        import rapor
+        now = datetime.datetime.now(rapor.TZ)
+        opened = datetime.datetime.fromtimestamp(plan["opened_ms"] / 1000, rapor.TZ)
+        rapor.record({
+            "symbol": symbol, "side": plan["side"], "tf": plan.get("tf"),
+            "opened": opened.isoformat(timespec="seconds"), "closed": now.isoformat(timespec="seconds"),
+            "hours": round((now - opened).total_seconds() / 3600, 2),
+            "entry": entry, "sl": sl, "tp": tp, "risk_usdt": round(risk, 2),
+            "net": None if net is None else round(net, 2),
+            "r": None if (net is None or not risk) else round(net / risk, 3),
+            "partial": partial, "exit": exit_type,
+        })
+        rapor.check_stop_alerts(notify)
+    except Exception as e:
+        print(f"  {symbol}: rapor kaydı yazılamadı ({e})")
+    return exit_type
+
+
 def manage_positions(notify):
     """
     Her çalıştırmada (dakikada bir) çağrılır:
@@ -359,8 +410,9 @@ def manage_positions(notify):
                 res = "sonuç okunamadı – Binance'te Trade History'ye bak"
             else:
                 res = f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
+            exit_type = _record_close(symbol, plan, net, None, notify)
             icon = "✅" if (net or 0) > 0 else "🔻"
-            notify(f"{icon} {symbol} pozisyonu kapandı – {res}")
+            notify(f"{icon} {symbol} pozisyonu kapandı ({exit_type}) – {res}")
             del plans[symbol]
             changed = True
             continue
@@ -421,6 +473,7 @@ def manage_positions(notify):
             notify(f"⏰ {symbol}: kalan yarı {hours:.1f} saatte TP'ye ulaşamadı, kapatıldı – {res}")
         else:
             notify(f"⏰ {symbol}: {candles} mumda ({tf}, {hours:.1f} saat) yarı kâra ulaşamadı, kapatıldı – {res}")
+        _record_close(symbol, plan, net, "SÜRE", notify)
         del plans[symbol]
         changed = True
 
@@ -568,6 +621,7 @@ def open_trade(gate_symbol, alert, timeframe=None):
         "qty": filled_qty, "half": half, "be_done": half == 0, "sl_ref": list(sl_ref),
         "pos_side": pos_side, "hedge": hedge, "tick": tick, "step": step,
         "opened_ms": int(time.time() * 1000), "tf": timeframe,
+        "sl": float(sl_str), "risk_usdt": filled_qty * abs(fill - float(sl_str)),
     }
     _save_plans(plans)
 
