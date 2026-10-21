@@ -26,7 +26,7 @@ import pandas as pd
 # =========================================================================
 DEFAULT_SYMBOLS = ("BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT, DOGE_USDT, ADA_USDT, "
                    "AVAX_USDT, LINK_USDT, DOT_USDT, LTC_USDT, TRX_USDT, SUI_USDT, NEAR_USDT, "
-                   "APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, PEPE_USDT, SHIB_USDT")
+                   "APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, SHIB_USDT")
 SYMBOLS = [s.strip().upper() for s in os.environ.get("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 # Virgülle birden fazla zaman dilimi: her biri kendi mumu kapandığında taranır
 TIMEFRAMES = [t.strip() for t in os.environ.get("TIMEFRAMES", "15m, 1h").split(",") if t.strip()]
