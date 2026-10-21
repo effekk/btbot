@@ -85,7 +85,7 @@ chmod 755 "$DIR/run.sh"
 cp "$DIR/repo/requirements.txt" "$DIR/.requirements.kurulu"
 chown "$BOT_USER:$BOT_USER" "$DIR/run.sh" "$DIR/.requirements.kurulu"
 
-echo "==> 6/6 Zamanlayıcı (her 15 dakikada bir: :00, :15, :30, :45 + 20 sn)"
+echo "==> 6/6 Zamanlayıcı (her dakika; coin taraması sadece mum kapanışlarında)"
 cat > /etc/systemd/system/sinyalbot.service <<EOF
 [Unit]
 Description=Sinyal botu (Gate.io sinyal + Binance Futures)
@@ -102,10 +102,10 @@ EOF
 
 cat > /etc/systemd/system/sinyalbot.timer <<'EOF'
 [Unit]
-Description=Sinyal botunu 15 dakikada bir çalıştır
+Description=Sinyal botunu her dakika çalıştır (pozisyon takibi; tarama mum kapanışlarında)
 
 [Timer]
-OnCalendar=*:0/15:20
+OnCalendar=*:*:20
 AccuracySec=1s
 Unit=sinyalbot.service
 
@@ -135,6 +135,7 @@ chmod 755 /usr/local/bin/sinyalbot-test /usr/local/bin/sinyalbot-log /usr/local/
 timedatectl set-ntp true 2>/dev/null || true
 systemctl daemon-reload
 systemctl enable --now sinyalbot.timer >/dev/null
+systemctl restart sinyalbot.timer
 
 echo
 echo "==> Kurulum tamam. Şimdi test mesajı gönderiliyor..."
