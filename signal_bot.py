@@ -493,6 +493,7 @@ def main():
     state.setdefault("last_scan", {})
     if TRADING_ENABLED:
         import binance_trader
+        binance_trader.manage_positions(send_telegram)   # yarı kâr → SL girişe, kapanış bildirimi
         binance_trader.cleanup_orphan_orders()
     now_ts = time.time()
     errors, report, sent, scanned = [], [], 0, []
