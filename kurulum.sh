@@ -70,8 +70,21 @@ chmod 600 "$DIR/secrets.env"
 # Her çalıştırmada: GitHub'dan güncelle, ayarları yükle, botu çalıştır
 cat > "$DIR/run.sh" <<'EOF'
 #!/bin/bash
-cd /opt/sinyalbot
-git -C repo pull --ff-only -q 2>/dev/null || echo "Uyarı: GitHub'dan güncelleme alınamadı, mevcut kodla devam"
+cd /opt/sinyalbot || exit 1
+# Aynı anda iki bot çalışmasın (zamanlayıcı + elle test). Diğeri bitene kadar en fazla 2 dk bekler.
+exec 9>/opt/sinyalbot/.calisiyor.lock
+if ! flock -w 120 9; then
+  echo "Başka bir çalıştırma sürüyor, bu sefer atlandı."
+  exit 0
+fi
+# GitHub'dan güncelle (başarısız olursa bir kez daha dene, hatayı göster)
+if ! out=$(git -C repo pull --ff-only -q 2>&1); then
+  sleep 3
+  if ! out=$(git -C repo pull --ff-only -q 2>&1); then
+    echo "Uyarı: GitHub'dan güncelleme alınamadı, mevcut kodla devam. Git hatası:"
+    echo "$out"
+  fi
+fi
 if ! cmp -s repo/requirements.txt .requirements.kurulu 2>/dev/null; then
   venv/bin/pip install -q --disable-pip-version-check -r repo/requirements.txt && cp repo/requirements.txt .requirements.kurulu
 fi
