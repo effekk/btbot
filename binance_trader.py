@@ -40,6 +40,13 @@ TRIM_TOLERANCE = 0.02         # gerçek SL zararı hedefi %2'den fazla aşarsa f
 PARTIAL_AT = 0.5              # giriş→TP mesafesinin bu oranında (yarısında) kısmi kâr alınır
 PARTIAL_SIZE = 0.5            # kısmi kârda pozisyonun ne kadarı kapanır (%50)
 
+# Zaman sınırı: yarı kâra bu kadar mumda ulaşamayan pozisyon piyasa fiyatından kapatılır
+MAX_HOLD_CANDLES = {"15m": 16, "1h": 24}   # 15m: 4 saat, 1h: 24 saat
+DEFAULT_HOLD_CANDLES = 24                  # listede olmayan zaman dilimleri için
+AFTER_PARTIAL_MULT = 2                     # yarı kâr alındıysa kalan yarıya süre × 2 (0 = süre sınırı yok)
+TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400,
+              "8h": 28800, "1d": 86400}
+
 IS_DEMO = "demo" in BASE_URL or "testnet" in BASE_URL
 
 
@@ -384,6 +391,38 @@ def manage_positions(notify):
                     notify(f"❌ {symbol}: SL girişe konamadı ve kalan pozisyon kapatılamadı – ELLE KONTROL ET! ({e2})")
             plan["be_done"] = True
             changed = True
+            continue
+
+        # Zaman sınırı
+        tf = plan.get("tf") or "1h"
+        candles = MAX_HOLD_CANDLES.get(tf, DEFAULT_HOLD_CANDLES)
+        partial_taken = plan["be_done"] and plan.get("half", 0) > 0
+        if not candles or (partial_taken and not AFTER_PARTIAL_MULT):
+            continue
+        limit_s = candles * TF_SECONDS.get(tf, 3600) * (AFTER_PARTIAL_MULT if partial_taken else 1)
+        age_s = time.time() - plan["opened_ms"] / 1000
+        if age_s < limit_s:
+            continue
+        amt_str = f"{amt:.{_decimals(plan['step'])}f}"
+        try:
+            _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
+        except Exception as e:
+            if not plan.get("time_close_error"):
+                notify(f"❌ {symbol}: süre doldu ama pozisyon kapatılamadı – ELLE KONTROL ET! ({e})")
+                plan["time_close_error"] = True
+                changed = True
+            continue
+        time.sleep(1.5)
+        _cancel_all(symbol)
+        net = _realized_since(symbol, plan["opened_ms"] - 5000)
+        res = "sonuç okunamadı" if net is None else f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
+        hours = age_s / 3600
+        if partial_taken:
+            notify(f"⏰ {symbol}: kalan yarı {hours:.1f} saatte TP'ye ulaşamadı, kapatıldı – {res}")
+        else:
+            notify(f"⏰ {symbol}: {candles} mumda ({tf}, {hours:.1f} saat) yarı kâra ulaşamadı, kapatıldı – {res}")
+        del plans[symbol]
+        changed = True
 
     if changed:
         _save_plans(plans)
@@ -392,7 +431,17 @@ def manage_positions(notify):
 # =========================================================================
 # Ana fonksiyon
 # =========================================================================
-def open_trade(gate_symbol, alert):
+def _time_note(timeframe):
+    tf = timeframe or "1h"
+    candles = MAX_HOLD_CANDLES.get(tf, DEFAULT_HOLD_CANDLES)
+    if not candles:
+        return ""
+    h = candles * TF_SECONDS.get(tf, 3600) / 3600
+    after = f"yarı kâr alınırsa {h * AFTER_PARTIAL_MULT:g} saat" if AFTER_PARTIAL_MULT else "yarı kâr alınırsa süre sınırı yok"
+    return f"\n⏰ Süre sınırı: {h:g} saat ({candles} mum), {after}"
+
+
+def open_trade(gate_symbol, alert, timeframe=None):
     """
     alert: signal_bot.check_alert sonucu (side, entry, stop, target ...).
     Dönüş: (açıldı_mı: bool, Telegram mesajı: str)
@@ -518,7 +567,7 @@ def open_trade(gate_symbol, alert):
         "side": side, "entry": fill, "sl_str": sl_str, "tp_str": tp_str, "mid": float(mid_str),
         "qty": filled_qty, "half": half, "be_done": half == 0, "sl_ref": list(sl_ref),
         "pos_side": pos_side, "hedge": hedge, "tick": tick, "step": step,
-        "opened_ms": int(time.time() * 1000),
+        "opened_ms": int(time.time() * 1000), "tf": timeframe,
     }
     _save_plans(plans)
 
@@ -533,7 +582,7 @@ def open_trade(gate_symbol, alert):
         f"🛑 SL: {sl_str} → zarar ≈ -{loss_at_sl:.0f} USDT\n"
         f"🎯 TP: {tp_str} → kâr ≈ +{gain_at_tp:.0f} USDT\n"
         f"(komisyon hariç; giriş+çıkış ≈ {notional_real * 0.001:.0f} USDT)"
-        + partial_note + trim_note + tp_note
+        + partial_note + _time_note(timeframe) + trim_note + tp_note
     )
     return True, msg
 
