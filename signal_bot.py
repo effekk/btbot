@@ -40,6 +40,7 @@ def _flag(name):
 TEST_RUN = _flag("TEST_RUN")
 # "true" ise sinyalde Binance Futures'ta otomatik işlem açılır (binance_trader.py)
 TRADING_ENABLED = _flag("TRADING_ENABLED")
+REPORT_NOW = _flag("REPORT_NOW")       # sinyalbot-rapor: raporu hemen gönder
 TZ = ZoneInfo("Europe/Istanbul")      # mesajlardaki saatler Türkiye saati
 STATE_FILE = "state.json"
 
@@ -494,6 +495,11 @@ def main():
     if TRADING_ENABLED:
         import binance_trader
         binance_trader.manage_positions(send_telegram)   # yarı kâr → SL girişe, kapanış bildirimi
+        import rapor
+        rapor.maybe_send_weekly(send_telegram, binance_trader.status_line, force=REPORT_NOW)
+        if REPORT_NOW:
+            print("Rapor gönderildi.")
+            return
         binance_trader.cleanup_orphan_orders()
     now_ts = time.time()
     errors, report, sent, scanned = [], [], 0, []
