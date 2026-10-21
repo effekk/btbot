@@ -36,6 +36,9 @@ LOSS_PCT_OF_MARGIN = 0.30     # SL'de teminatın %30'u kaybedilir (1000 $ → 30
 MAX_OPEN_POSITIONS = 4        # aynı anda en fazla kaç pozisyon
 MAX_LEVERAGE = 50             # coinin izni daha yüksek olsa bile bu sınırı aşma
 MAX_PRICE_DIFF_PCT = 1.0      # Gate sinyal fiyatı ile Binance fiyatı bundan fazla farklıysa işlem açma
+TRIM_TOLERANCE = 0.02         # gerçek SL zararı hedefi %2'den fazla aşarsa fazlası kapatılır
+PARTIAL_AT = 0.5              # giriş→TP mesafesinin bu oranında (yarısında) kısmi kâr alınır
+PARTIAL_SIZE = 0.5            # kısmi kârda pozisyonun ne kadarı kapanır (%50)
 
 IS_DEMO = "demo" in BASE_URL or "testnet" in BASE_URL
 
@@ -200,20 +203,190 @@ def cleanup_orphan_orders():
 
 
 # =========================================================================
+# Fiyat ve gerçek dolum
+# =========================================================================
+def _book_price(symbol, side):
+    """LONG için en iyi satış (ask), SHORT için en iyi alış (bid) fiyatı."""
+    try:
+        t = _request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol}, signed=False)
+        return float(t["askPrice"] if side == "AL" else t["bidPrice"]) or None
+    except Exception:
+        return None
+
+
+def _real_fill(symbol, order, qty, fallback_price):
+    """Piyasa emrinin gerçek ortalama fiyatı ve miktarı. Yanıtta yoksa emri ve pozisyonu sorgular."""
+    price = float(order.get("avgPrice") or 0)
+    filled = float(order.get("executedQty") or 0)
+    order_id = order.get("orderId")
+    for _ in range(4):
+        if price > 0 and filled > 0:
+            return price, filled
+        time.sleep(0.5)
+        try:
+            if order_id is not None:
+                o = _request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+                price = float(o.get("avgPrice") or 0) or price
+                filled = float(o.get("executedQty") or 0) or filled
+        except Exception:
+            pass
+    if price <= 0 or filled <= 0:
+        try:
+            for p in _request("GET", "/fapi/v3/positionRisk", {"symbol": symbol}):
+                if abs(float(p["positionAmt"])) > 0:
+                    price = price or float(p["entryPrice"])
+                    filled = filled or abs(float(p["positionAmt"]))
+        except Exception:
+            pass
+    return (price if price > 0 else fallback_price), (filled if filled > 0 else qty)
+
+
+# =========================================================================
 # SL / TP emirleri (önce yeni Algo Order API, olmazsa eski uç nokta)
 # =========================================================================
-def _place_close_order(symbol, close_side, order_type, trigger, pos_side):
+def _place_close_order(symbol, close_side, order_type, trigger, pos_side, qty=None, hedge=False):
+    """
+    Koşullu kapatma emri. qty=None ise pozisyonun TAMAMINI kapatır (closePosition),
+    qty verilirse sadece o kadarını kapatır (kısmi kâr al).
+    Dönüş: ("algo", algoId) ya da ("legacy", orderId) – emri sonra iptal edebilmek için.
+    """
     params = {"algoType": "CONDITIONAL", "symbol": symbol, "side": close_side, "type": order_type,
-              "triggerPrice": trigger, "closePosition": "true", "workingType": "MARK_PRICE",
-              "positionSide": pos_side}
+              "triggerPrice": trigger, "workingType": "MARK_PRICE", "positionSide": pos_side}
+    if qty is None:
+        params["closePosition"] = "true"
+    else:
+        params["quantity"] = qty
+        if not hedge:
+            params["reduceOnly"] = "true"
     try:
-        return _request("POST", "/fapi/v1/algoOrder", params)
+        r = _request("POST", "/fapi/v1/algoOrder", params)
+        return ("algo", r.get("algoId"))
     except BinanceError as e:
         if e.status in (404, 405) or e.code in (-1102, -1104, -1116, -1000, -5000):
-            legacy = {"symbol": symbol, "side": close_side, "type": order_type, "stopPrice": trigger,
-                      "closePosition": "true", "workingType": "MARK_PRICE", "positionSide": pos_side}
-            return _request("POST", "/fapi/v1/order", legacy)
+            legacy = {k: v for k, v in params.items() if k not in ("algoType", "triggerPrice")}
+            legacy["stopPrice"] = trigger
+            r = _request("POST", "/fapi/v1/order", legacy)
+            return ("legacy", r.get("orderId"))
         raise
+
+
+def _cancel_order_ref(symbol, ref):
+    kind, oid = ref
+    if oid is None:
+        return
+    try:
+        if kind == "algo":
+            _request("DELETE", "/fapi/v1/algoOrder", {"algoId": oid})
+        else:
+            _request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": oid})
+    except BinanceError as e:
+        print(f"  {symbol}: eski emir iptal edilemedi ({e}) – zaten tetiklenmiş/iptal olmuş olabilir")
+
+
+def _market_close(symbol, close_side, qty_str, pos_side, hedge):
+    close = {"symbol": symbol, "side": close_side, "type": "MARKET", "quantity": qty_str,
+             "positionSide": pos_side}
+    if not hedge:
+        close["reduceOnly"] = "true"
+    return _request("POST", "/fapi/v1/order", close)
+
+
+# =========================================================================
+# İşlem planları (yarı kâr + SL'yi girişe çekme için)
+# =========================================================================
+PLANS_FILE = "pozisyonlar.json"
+
+
+def _load_plans():
+    try:
+        with open(PLANS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_plans(plans):
+    tmp = PLANS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(plans, f, indent=1)
+    os.replace(tmp, PLANS_FILE)
+
+
+def _realized_since(symbol, start_ms):
+    """Pozisyon açıldığından beri gerçekleşen net sonuç (kâr/zarar + komisyon + funding)."""
+    try:
+        rows = _request("GET", "/fapi/v1/income", {"symbol": symbol, "startTime": int(start_ms), "limit": 1000})
+        return sum(float(r["income"]) for r in rows
+                   if r.get("incomeType") in ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE"))
+    except Exception:
+        return None
+
+
+def manage_positions(notify):
+    """
+    Her çalıştırmada (dakikada bir) çağrılır:
+      - Yarı kâr emri gerçekleştiyse eski SL'yi iptal edip SL'yi giriş fiyatına çeker.
+      - Pozisyon tamamen kapandıysa sonucu Telegram'a bildirir ve planı siler.
+    """
+    if not API_KEY:
+        return
+    plans = _load_plans()
+    if not plans:
+        return
+    try:
+        amounts = {p["symbol"]: abs(float(p["positionAmt"])) for p in _positions()}
+    except Exception as e:
+        print(f"  pozisyon yönetimi: pozisyonlar okunamadı ({e})")
+        return
+
+    changed = False
+    for symbol, plan in list(plans.items()):
+        amt = amounts.get(symbol, 0.0)
+        close_side = "SELL" if plan["side"] == "AL" else "BUY"
+
+        # Pozisyon tamamen kapanmış
+        if amt == 0:
+            net = _realized_since(symbol, plan["opened_ms"] - 5000)
+            _cancel_all(symbol)
+            if net is None:
+                res = "sonuç okunamadı – Binance'te Trade History'ye bak"
+            else:
+                res = f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
+            icon = "✅" if (net or 0) > 0 else "🔻"
+            notify(f"{icon} {symbol} pozisyonu kapandı – {res}")
+            del plans[symbol]
+            changed = True
+            continue
+
+        # Yarı kâr gerçekleşti mi? (kalan miktar, ilk miktardan yarı kadar azalmışsa)
+        if not plan["be_done"] and plan.get("half", 0) > 0 and amt <= plan["qty"] - 0.9 * plan["half"]:
+            tick = plan["tick"]
+            entry = plan["entry"]
+            # Giriş fiyatı, kâr tarafına yuvarlanır (LONG: yukarı, SHORT: aşağı)
+            be = (math.ceil(entry / tick) if plan["side"] == "AL" else math.floor(entry / tick)) * tick
+            be_str = f"{be:.{_decimals(tick)}f}"
+            amt_str = f"{amt:.{_decimals(plan['step'])}f}"
+            _cancel_order_ref(symbol, plan["sl_ref"])
+            try:
+                plan["sl_ref"] = list(_place_close_order(symbol, close_side, "STOP_MARKET", be_str,
+                                                         plan["pos_side"]))
+                profit = plan["half"] * abs(plan["mid"] - entry)
+                notify(f"🔸 {symbol}: hedefin yarısına gelindi – pozisyonun yarısı kapandı "
+                       f"(≈ +{profit:.0f} USDT).\nSL giriş fiyatına çekildi ({be_str}): kalan yarı artık risksiz. "
+                       f"TP {plan['tp_str']} bekleniyor.")
+            except Exception as e:
+                # SL girişe konamadıysa (ör. fiyat zaten girişin altına döndü) kalanı hemen kapat
+                try:
+                    _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
+                    notify(f"🔸 {symbol}: yarısı kârla kapandı; SL girişe konamadı ({e}), "
+                           f"kalan pozisyon piyasa fiyatından kapatıldı.")
+                except Exception as e2:
+                    notify(f"❌ {symbol}: SL girişe konamadı ve kalan pozisyon kapatılamadı – ELLE KONTROL ET! ({e2})")
+            plan["be_done"] = True
+            changed = True
+
+    if changed:
+        _save_plans(plans)
 
 
 # =========================================================================
@@ -249,8 +422,9 @@ def open_trade(gate_symbol, alert):
     if (side == "AL" and not (sl < mark < tp)) or (side == "SAT" and not (tp < mark < sl)):
         return False, f"⏭ {symbol}: fiyat SL/TP aralığının dışında, işlem açılmadı."
 
-    # 3) Büyüklük ve kaldıraç
-    stop_frac = abs(mark - sl) / mark
+    # 3) Büyüklük ve kaldıraç – piyasa emri en iyi alış/satış fiyatından dolacağı için onu kullan
+    px = _book_price(symbol, side) or mark
+    stop_frac = abs(px - sl) / px
     target_loss = MARGIN_USDT * LOSS_PCT_OF_MARGIN
     notional = target_loss / stop_frac
     leverage = max(1, math.ceil(notional / MARGIN_USDT))
@@ -263,8 +437,8 @@ def open_trade(gate_symbol, alert):
             leverage = allowed2
             notional = MARGIN_USDT * leverage
 
-    qty = float(_floor_qty(min(notional / mark, max_qty), step))
-    if qty < min_qty or qty * mark < min_notional:
+    qty = float(_floor_qty(min(notional / px, max_qty), step))
+    if qty < min_qty or qty * px < min_notional:
         return False, f"⏭ {symbol}: hesaplanan miktar çok küçük, işlem açılmadı."
 
     # 4) Hesap ayarları
@@ -285,30 +459,68 @@ def open_trade(gate_symbol, alert):
     order = _request("POST", "/fapi/v1/order", {
         "symbol": symbol, "side": open_side, "type": "MARKET", "quantity": _floor_qty(qty, step),
         "positionSide": pos_side, "newOrderRespType": "RESULT"})
-    fill = float(order.get("avgPrice") or 0) or mark
-    filled_qty = float(order.get("executedQty") or qty)
+    fill, filled_qty = _real_fill(symbol, order, qty, px)
 
     # 6) SL ve TP – SL konamazsa pozisyonu hemen kapat
     sl_str, tp_str = _round_price(sl, tick), _round_price(tp, tick)
     try:
-        _place_close_order(symbol, close_side, "STOP_MARKET", sl_str, pos_side)
+        sl_ref = _place_close_order(symbol, close_side, "STOP_MARKET", sl_str, pos_side)
     except Exception as e:
-        close = {"symbol": symbol, "side": close_side, "type": "MARKET",
-                 "quantity": _floor_qty(filled_qty, step), "positionSide": pos_side}
-        if not hedge:
-            close["reduceOnly"] = "true"
         try:
-            _request("POST", "/fapi/v1/order", close)
+            _market_close(symbol, close_side, _floor_qty(filled_qty, step), pos_side, hedge)
             note = "pozisyon güvenlik için hemen kapatıldı"
         except Exception as e2:
             note = f"POZİSYON KAPATILAMADI, ELLE KAPAT! ({e2})"
         return False, f"❌ {symbol}: SL emri konamadı ({e}) – {note}."
+
+    # 7) Gerçek dolum fiyatıyla SL zararı hedefi aşıyorsa fazla miktarı hemen kapat
+    trim_note = ""
+    max_qty_for_target = target_loss / abs(fill - float(sl_str))
+    excess = float(_floor_qty(filled_qty - max_qty_for_target, step))
+    if filled_qty * abs(fill - float(sl_str)) > target_loss * (1 + TRIM_TOLERANCE) and excess >= min_qty:
+        trim = {"symbol": symbol, "side": close_side, "type": "MARKET",
+                "quantity": _floor_qty(excess, step), "positionSide": pos_side}
+        if not hedge:
+            trim["reduceOnly"] = "true"
+        try:
+            _request("POST", "/fapi/v1/order", trim)
+            filled_qty = float(_floor_qty(filled_qty - excess, step))
+            trim_note = f"\n(giriş kayması nedeniyle {excess:g} adet hemen kapatıldı, SL zararı ~{target_loss:.0f} USDT'ye çekildi)"
+        except Exception as e:
+            trim_note = f"\n⚠️ Fazla miktar kapatılamadı ({e})"
 
     tp_note = ""
     try:
         _place_close_order(symbol, close_side, "TAKE_PROFIT_MARKET", tp_str, pos_side)
     except Exception as e:
         tp_note = f"\n⚠️ TP emri konamadı ({e}) – TP'yi elle koy."
+
+    # 8) Yarı kâr: hedeflenen hareketin yarısında pozisyonun %50'si kapanır
+    mid = fill + (float(tp_str) - fill) * PARTIAL_AT
+    mid_str = _round_price(mid, tick)
+    half = float(_floor_qty(filled_qty * PARTIAL_SIZE, step))
+    partial_note = ""
+    if half >= min_qty and filled_qty - half >= min_qty and half * float(mid_str) >= min_notional:
+        try:
+            _place_close_order(symbol, close_side, "TAKE_PROFIT_MARKET", mid_str, pos_side,
+                               qty=_floor_qty(half, step), hedge=hedge)
+            partial_note = (f"\n🔸 Yarı kâr: {mid_str} → {half:,.{_decimals(step)}f} adet (%{PARTIAL_SIZE * 100:.0f}) "
+                            f"kapanır ≈ +{half * abs(float(mid_str) - fill):.0f} USDT, SL girişe çekilir")
+        except Exception as e:
+            half = 0
+            partial_note = f"\n⚠️ Yarı kâr emri konamadı ({e}) – sadece SL/TP aktif."
+    else:
+        half = 0
+        partial_note = "\n(miktar çok küçük olduğu için yarı kâr emri konmadı)"
+
+    plans = _load_plans()
+    plans[symbol] = {
+        "side": side, "entry": fill, "sl_str": sl_str, "tp_str": tp_str, "mid": float(mid_str),
+        "qty": filled_qty, "half": half, "be_done": half == 0, "sl_ref": list(sl_ref),
+        "pos_side": pos_side, "hedge": hedge, "tick": tick, "step": step,
+        "opened_ms": int(time.time() * 1000),
+    }
+    _save_plans(plans)
 
     notional_real = filled_qty * fill
     loss_at_sl = notional_real * abs(fill - float(sl_str)) / fill
@@ -321,7 +533,7 @@ def open_trade(gate_symbol, alert):
         f"🛑 SL: {sl_str} → zarar ≈ -{loss_at_sl:.0f} USDT\n"
         f"🎯 TP: {tp_str} → kâr ≈ +{gain_at_tp:.0f} USDT\n"
         f"(komisyon hariç; giriş+çıkış ≈ {notional_real * 0.001:.0f} USDT)"
-        + tp_note
+        + partial_note + trim_note + tp_note
     )
     return True, msg
 
