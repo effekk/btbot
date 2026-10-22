@@ -380,6 +380,56 @@ def _record_close(symbol, plan, net, exit_type, notify):
     return exit_type
 
 
+WATCH_FILE = "izlenen_pozisyonlar.json"
+
+
+def _watch_untracked(rows, plans, notify):
+    """
+    Botun planı olmayan pozisyonları da izler (eski pozisyonlar, elle açılanlar):
+    kapandıklarında Telegram'a sonucu bildirir.
+    """
+    try:
+        with open(WATCH_FILE) as f:
+            watch = json.load(f)
+    except Exception:
+        watch = {}
+    now_ms = int(time.time() * 1000)
+    current = {p["symbol"]: p for p in rows}
+
+    for symbol, info in list(watch.items()):
+        if symbol in current:
+            continue
+        # Planlı pozisyonların kapanış bildirimini plan yönetimi yapıyor – burada tekrar bildirme
+        if symbol not in plans and not info.get("planned"):
+            net = _realized_since(symbol, info["since_ms"] - 5000)
+            side = info.get("side", "")
+            if net is None:
+                res = "sonuç okunamadı – Binance'te Trade History'ye bak"
+            else:
+                res = f"net ≈ {'+' if net >= 0 else ''}{net:.0f} USDT"
+                if info.get("seen_late"):
+                    res += " (izlemeye sonradan alındı: açılış komisyonu hariç olabilir)"
+            icon = "✅" if (net or 0) > 0 else "🔻"
+            notify(f"{icon} {symbol} {side} pozisyonu kapandı – {res}")
+            _log("untracked_close", symbol, net=None if net is None else round(net, 2))
+            _cancel_all(symbol)
+        del watch[symbol]
+
+    first_run = not os.path.exists(WATCH_FILE)
+    for symbol, p in current.items():
+        if symbol not in watch:
+            amt = float(p["positionAmt"])
+            watch[symbol] = {"since_ms": now_ms, "side": "LONG" if amt > 0 else "SHORT",
+                             "seen_late": first_run or symbol not in plans}
+        if symbol in plans:
+            watch[symbol]["planned"] = True
+
+    tmp = WATCH_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(watch, f, indent=1)
+    os.replace(tmp, WATCH_FILE)
+
+
 def manage_positions(notify):
     """
     Her çalıştırmada (dakikada bir) çağrılır:
@@ -389,13 +439,14 @@ def manage_positions(notify):
     if not API_KEY:
         return
     plans = _load_plans()
-    if not plans:
-        return
     try:
-        amounts = {p["symbol"]: abs(float(p["positionAmt"])) for p in _positions()}
+        rows = _positions()
     except Exception as e:
         print(f"  pozisyon yönetimi: pozisyonlar okunamadı ({e})")
         return
+    amounts = {p["symbol"]: abs(float(p["positionAmt"])) for p in rows}
+
+    _watch_untracked(rows, plans, notify)
 
     changed = False
     for symbol, plan in list(plans.items()):
@@ -430,6 +481,7 @@ def manage_positions(notify):
                 plan["sl_ref"] = list(_place_close_order(symbol, close_side, "STOP_MARKET", be_str,
                                                          plan["pos_side"]))
                 profit = plan["half"] * abs(plan["mid"] - entry)
+                _log("partial", symbol, profit=round(profit, 2))
                 notify(f"🔸 {symbol}: hedefin yarısına gelindi – pozisyonun yarısı kapandı "
                        f"(≈ +{profit:.0f} USDT).\nSL giriş fiyatına çekildi ({be_str}): kalan yarı artık risksiz. "
                        f"TP {plan['tp_str']} bekleniyor.")
@@ -639,6 +691,58 @@ def open_trade(gate_symbol, alert, timeframe=None):
         + partial_note + _time_note(timeframe) + trim_note + tp_note
     )
     return True, msg
+
+
+def _income_between(start_ms, end_ms):
+    out, cur = [], int(start_ms)
+    for _ in range(20):
+        rows = _request("GET", "/fapi/v1/income", {"startTime": cur, "endTime": int(end_ms), "limit": 1000})
+        out += rows
+        if len(rows) < 1000:
+            break
+        cur = int(rows[-1]["time"]) + 1
+    return out
+
+
+def daily_numbers(start_ms, end_ms):
+    """Günlük rapor için: günün gerçekleşen K/Z, komisyon, funding; bakiye; açık pozisyonlar."""
+    parts = {"REALIZED_PNL": 0.0, "COMMISSION": 0.0, "FUNDING_FEE": 0.0}
+    for r in _income_between(start_ms, end_ms):
+        if r.get("incomeType") in parts:
+            parts[r["incomeType"]] += float(r["income"])
+    try:
+        acct = _request("GET", "/fapi/v3/account")
+        wallet = float(acct["totalWalletBalance"])
+        upnl = float(acct["totalUnrealizedProfit"])
+    except Exception:
+        wallet = next((float(a["balance"]) for a in _request("GET", "/fapi/v3/balance") if a["asset"] == "USDT"), 0.0)
+        upnl = 0.0
+    plans = _load_plans()
+    try:
+        with open(WATCH_FILE) as f:
+            watch = json.load(f)
+    except Exception:
+        watch = {}
+    now = time.time()
+    positions = []
+    for p in _positions():
+        amt = float(p["positionAmt"])
+        opened = (plans.get(p["symbol"], {}).get("opened_ms") or watch.get(p["symbol"], {}).get("since_ms"))
+        positions.append({"symbol": p["symbol"], "side": "LONG" if amt > 0 else "SHORT",
+                          "upnl": float(p.get("unRealizedProfit") or 0),
+                          "hours": (now - opened / 1000) / 3600 if opened else None})
+    if not upnl:
+        upnl = sum(x["upnl"] for x in positions)
+    return {"realized": parts["REALIZED_PNL"], "commission": parts["COMMISSION"],
+            "funding": parts["FUNDING_FEE"], "wallet": wallet, "upnl": upnl, "positions": positions}
+
+
+def _log(kind, symbol=None, **data):
+    try:
+        import rapor
+        rapor.log_event(kind, symbol, **data)
+    except Exception as e:
+        print(f"  olay kaydedilemedi ({e})")
 
 
 def status_line():
