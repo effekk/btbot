@@ -26,7 +26,7 @@ import pandas as pd
 # =========================================================================
 DEFAULT_SYMBOLS = ("BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT, DOGE_USDT, ADA_USDT, "
                    "AVAX_USDT, LINK_USDT, DOT_USDT, LTC_USDT, TRX_USDT, SUI_USDT, NEAR_USDT, "
-                   "APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, SHIB_USDT")
+                   "APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, PEPE_USDT, SHIB_USDT")
 SYMBOLS = [s.strip().upper() for s in os.environ.get("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
 # Virgülle birden fazla zaman dilimi: her biri kendi mumu kapandığında taranır
 TIMEFRAMES = [t.strip() for t in os.environ.get("TIMEFRAMES", "15m, 1h").split(",") if t.strip()]
@@ -440,7 +440,17 @@ def try_trade(symbol, timeframe, alert):
     except Exception as e:
         opened, msg = False, f"❌ {symbol} {timeframe}: işlem açılamadı – {e}"
     print("  " + msg.replace("\n", " | "))
+    kind = "open" if opened else ("skip" if msg.startswith("⏭") else "error")
+    _log_event(kind, symbol, tf=timeframe, msg=msg.split("\n")[0])
     send_telegram(msg)
+
+
+def _log_event(kind, symbol=None, **data):
+    try:
+        import rapor
+        rapor.log_event(kind, symbol, **data)
+    except Exception as e:
+        print(f"  olay kaydedilemedi ({e})")
 
 
 def scan_timeframe(timeframe, state, errors, report):
@@ -471,6 +481,7 @@ def scan_timeframe(timeframe, state, errors, report):
                     state["alerted"][key] = time.time()
                     sent += 1
                     print(f"{symbol} {timeframe}: {alert['side']} sinyali gönderildi")
+                    _log_event("signal", symbol, tf=timeframe, side=alert["side"])
                     if TRADING_ENABLED:
                         try_trade(symbol, timeframe, alert)
             else:
@@ -496,6 +507,7 @@ def main():
         import binance_trader
         binance_trader.manage_positions(send_telegram)   # yarı kâr → SL girişe, kapanış bildirimi
         import rapor
+        rapor.maybe_send_daily(send_telegram, binance_trader.daily_numbers, force=REPORT_NOW)
         rapor.maybe_send_weekly(send_telegram, binance_trader.status_line, force=REPORT_NOW)
         if REPORT_NOW:
             print("Rapor gönderildi.")
