@@ -145,7 +145,7 @@ systemctl status sinyalbot.service --no-pager -n 5 || true
 EOF
 cat > /usr/local/bin/sinyalbot-rapor <<'EOF'
 #!/bin/bash
-# Performans raporunu hemen Telegram'a gönderir
+# Günlük (bugün şu ana kadar) ve haftalık raporu hemen Telegram'a gönderir
 exec runuser -u sinyalbot -- env REPORT_NOW=true /opt/sinyalbot/run.sh
 EOF
 chmod 755 /usr/local/bin/sinyalbot-test /usr/local/bin/sinyalbot-log /usr/local/bin/sinyalbot-durum /usr/local/bin/sinyalbot-rapor
@@ -165,4 +165,4 @@ echo "Faydalı komutlar:"
 echo "  sinyalbot-test    -> test mesajı gönder"
 echo "  sinyalbot-log     -> son çalıştırmaların çıktısı"
 echo "  sinyalbot-durum   -> bir sonraki çalışma zamanı"
-echo "  sinyalbot-rapor   -> performans raporunu şimdi gönder"
+echo "  sinyalbot-rapor   -> günlük + haftalık raporu şimdi gönder"
