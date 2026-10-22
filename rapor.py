@@ -2,7 +2,7 @@
 İşlem kaydı ve performans raporu.
 
 - Her kapanan işlem `islemler.jsonl` dosyasına bir satır olarak yazılır (sunucuda /opt/sinyalbot).
-- Her pazar 21:00'den sonraki ilk çalıştırmada Telegram'a haftalık rapor gider.
+- Her gün 23:55'ten sonra günlük, her pazar 21:00'den sonra haftalık rapor Telegram'a gider.
 - Durma noktası (düşüş / kayıp serisi) aşılırsa bir kez uyarı gönderilir. Bot durdurulmaz, karar senin.
 
 Elle rapor: sunucuda  sinyalbot-rapor
@@ -220,3 +220,174 @@ def check_stop_alerts(notify):
                f"Bot çalışmaya devam ediyor; sonuçlara birlikte bakalım.")
         st["streak_alert"] = True
     _save_status(st)
+
+
+# =========================================================================
+# Günlük rapor
+# =========================================================================
+EVENTS_FILE = "olaylar.jsonl"     # sinyal / açılan / atlanan / yarı kâr olayları
+DAILY_REPORT_HOUR = 23            # her gün bu saatten ...
+DAILY_REPORT_MINUTE = 55          # ... ve dakikadan sonraki ilk çalıştırmada gönderilir
+EVENTS_KEEP_DAYS = 60
+
+
+def log_event(kind, symbol=None, **data):
+    """kind: signal | open | skip | error | partial | untracked_close"""
+    try:
+        rec = {"ts": datetime.datetime.now(TZ).isoformat(timespec="seconds"), "kind": kind, "symbol": symbol}
+        rec.update(data)
+        with open(EVENTS_FILE, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"  olay kaydedilemedi ({e})")
+
+
+def _load_events(start_iso, end_iso):
+    out = []
+    try:
+        with open(EVENTS_FILE) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if start_iso <= e.get("ts", "") < end_iso:
+                    out.append(e)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def _prune_events():
+    cutoff = (datetime.datetime.now(TZ) - datetime.timedelta(days=EVENTS_KEEP_DAYS)).isoformat()
+    try:
+        with open(EVENTS_FILE) as f:
+            keep = [line for line in f if line.strip() and json.loads(line).get("ts", "") >= cutoff]
+        with open(EVENTS_FILE + ".tmp", "w") as f:
+            f.writelines(keep)
+        os.replace(EVENTS_FILE + ".tmp", EVENTS_FILE)
+    except Exception:
+        pass
+
+
+def _skip_reason(msg):
+    m = (msg or "").lower()
+    if "sınır" in m:
+        return "pozisyon sınırı"
+    if "zaten açık" in m:
+        return "aynı coinde pozisyon"
+    if "uzaklaşmış" in m or "aralığının dışında" in m:
+        return "fiyat kaçtı"
+    if "bakiye" in m:
+        return "bakiye"
+    if "küçük" in m:
+        return "miktar küçük"
+    return "diğer"
+
+
+GUNLER = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+
+
+def build_daily(day_start, day_end, bn=None):
+    """
+    day_start/day_end: TZ'li datetime. bn: binance_trader.daily_numbers(...) sonucu (yoksa None).
+    """
+    s_iso, e_iso = day_start.isoformat(), day_end.isoformat()
+    trades = [t for t in load() if s_iso <= t.get("closed", "") < e_iso]
+    events = _load_events(s_iso, e_iso)
+
+    lines = [f"📅 Günlük rapor – {day_start.strftime('%d.%m.%Y')} {GUNLER[day_start.weekday()]} "
+             f"({day_start.strftime('%H:%M')}–{day_end.strftime('%H:%M')})"]
+
+    # Günün net sonucu (Binance kayıtları: botun ve elle yapılan tüm işlemler)
+    if bn and not bn.get("error"):
+        net = bn["realized"] + bn["commission"] + bn["funding"]
+        start_bal = bn["wallet"] - net
+        pct = f" (%{net / start_bal * 100:+.1f})".replace(".", ",") if start_bal > 0 else ""
+        lines += ["", f"💰 Günün net sonucu: {_usd(net)} USDT{pct}",
+                  f"   gerçekleşen K/Z {_usd(bn['realized'])} · komisyon {_usd(bn['commission'])} · "
+                  f"funding {_usd(bn['funding'])}"]
+    elif bn and bn.get("error"):
+        lines += ["", f"💰 Binance rakamları okunamadı: {bn['error']}"]
+
+    # Kapanan bot işlemleri
+    s = stats(trades)
+    untracked = [e for e in events if e["kind"] == "untracked_close"]
+    lines.append("")
+    if s["n"]:
+        lines.append(f"🔁 Kapanan bot işlemi: {s['n']} (✅ {s['wins']} / 🔻 {s['losses']}) | "
+                     f"net {_usd(s['net'])} USDT | {_r(s['avg_r'])}/işlem")
+        best = max(trades, key=lambda t: t.get("net") or 0)
+        worst = min(trades, key=lambda t: t.get("net") or 0)
+        if s["n"] > 1:
+            lines.append(f"   En iyi: {best['symbol']} {_usd(best.get('net') or 0)} ({best.get('exit')}) · "
+                         f"En kötü: {worst['symbol']} {_usd(worst.get('net') or 0)} ({worst.get('exit')})")
+        lines.append("   Çıkışlar: " + " · ".join(f"{k} {v}" for k, v in
+                                                  sorted(s["exits"].items(), key=lambda kv: -kv[1])))
+    else:
+        lines.append("🔁 Kapanan bot işlemi yok")
+    partials = [e for e in events if e["kind"] == "partial"]
+    if partials:
+        lines.append(f"   🔸 Yarı kâr alınan: {len(partials)}")
+    if untracked:
+        tot = sum(e.get("net") or 0 for e in untracked)
+        lines.append(f"   Elle/eski pozisyon kapanışı: {len(untracked)} (net ≈ {_usd(tot)} USDT)")
+
+    # Sinyal ve işlem açma
+    sig = [e for e in events if e["kind"] == "signal"]
+    opened = [e for e in events if e["kind"] == "open"]
+    skipped = [e for e in events if e["kind"] == "skip"]
+    errors = [e for e in events if e["kind"] == "error"]
+    by_tf = {}
+    for e in sig:
+        by_tf[e.get("tf", "?")] = by_tf.get(e.get("tf", "?"), 0) + 1
+    tf_txt = " · ".join(f"{k} {v}" for k, v in sorted(by_tf.items()))
+    lines.append(f"🆕 Sinyal: {len(sig)}" + (f" ({tf_txt})" if tf_txt else "") +
+                 f" | Açılan: {len(opened)} | Atlanan: {len(skipped)}" + (f" | Hata: {len(errors)}" if errors else ""))
+    if skipped:
+        reasons = {}
+        for e in skipped:
+            r = _skip_reason(e.get("msg"))
+            reasons[r] = reasons.get(r, 0) + 1
+        lines.append("   Atlanma sebebi: " + " · ".join(f"{k} {v}" for k, v in
+                                                     sorted(reasons.items(), key=lambda kv: -kv[1])))
+
+    # Açık pozisyonlar ve bakiye
+    if bn and not bn.get("error"):
+        pos = bn.get("positions", [])
+        lines.append("")
+        if pos:
+            lines.append(f"📂 Açık pozisyonlar ({len(pos)}):")
+            for p in pos:
+                age = f" · {p['hours']:.1f} saat".replace(".", ",") if p.get("hours") is not None else ""
+                lines.append(f"   {p['symbol']} {p['side']} {_usd(p['upnl'])} USDT{age}")
+        else:
+            lines.append("📂 Açık pozisyon yok")
+        lines.append(f"💼 Bakiye: {bn['wallet']:,.0f} USDT".replace(",", ".") +
+                     f" | açık K/Z {_usd(bn['upnl'])} USDT")
+    return "\n".join(lines)
+
+
+def maybe_send_daily(notify, numbers_fn=None, force=False):
+    """Her gün DAILY_REPORT_HOUR:MINUTE'dan sonraki ilk çalıştırmada (ya da force ile hemen) gönderir."""
+    now = datetime.datetime.now(TZ)
+    st = _status()
+    today = now.date().isoformat()
+    due_time = now.replace(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE, second=0, microsecond=0)
+    due = now >= due_time and st.get("last_day") != today
+    if not (due or force):
+        return False
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    bn = None
+    if numbers_fn:
+        try:
+            bn = numbers_fn(int(start.timestamp() * 1000), int(now.timestamp() * 1000))
+        except Exception as e:
+            bn = {"error": str(e)}
+    notify(build_daily(start, now, bn))
+    if due:
+        st = _status()
+        st["last_day"] = today
+        _save_status(st)
+        _prune_events()
+    return True
