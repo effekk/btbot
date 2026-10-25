@@ -34,7 +34,7 @@ if [ -d "$DIR/repo/.git" ]; then
 else
   runuser -u "$BOT_USER" -- git clone -q "$REPO_URL" "$DIR/repo"
 fi
-for f in signal_bot.py binance_trader.py rapor.py requirements.txt ayarlar.env; do
+for f in signal_bot.py binance_trader.py rapor.py analiz.py requirements.txt ayarlar.env; do
   if [ ! -f "$DIR/repo/$f" ]; then
     echo "HATA: depoda $f bulunamadı. Önce GitHub'a yükle, sonra kurulumu tekrar çalıştır."
     exit 1
@@ -148,7 +148,13 @@ cat > /usr/local/bin/sinyalbot-rapor <<'EOF'
 # Günlük (bugün şu ana kadar) ve haftalık raporu hemen Telegram'a gönderir
 exec runuser -u sinyalbot -- env REPORT_NOW=true /opt/sinyalbot/run.sh
 EOF
-chmod 755 /usr/local/bin/sinyalbot-test /usr/local/bin/sinyalbot-log /usr/local/bin/sinyalbot-durum /usr/local/bin/sinyalbot-rapor
+cat > /usr/local/bin/sinyalbot-analiz <<'EOF'
+#!/bin/bash
+# Gerçek işlemler üzerinde çıkış kurallarını karşılaştırır, sonucu Telegram'a gönderir (1-2 dk sürebilir)
+cd /opt/sinyalbot || exit 1
+exec runuser -u sinyalbot -- bash -c 'set -a; . repo/ayarlar.env; . ./secrets.env; set +a; exec venv/bin/python repo/analiz.py'
+EOF
+chmod 755 /usr/local/bin/sinyalbot-test /usr/local/bin/sinyalbot-log /usr/local/bin/sinyalbot-durum /usr/local/bin/sinyalbot-rapor /usr/local/bin/sinyalbot-analiz
 
 timedatectl set-ntp true 2>/dev/null || true
 systemctl daemon-reload
@@ -166,3 +172,4 @@ echo "  sinyalbot-test    -> test mesajı gönder"
 echo "  sinyalbot-log     -> son çalıştırmaların çıktısı"
 echo "  sinyalbot-durum   -> bir sonraki çalışma zamanı"
 echo "  sinyalbot-rapor   -> günlük + haftalık raporu şimdi gönder"
+echo "  sinyalbot-analiz  -> gerçek işlemlerde çıkış kurallarını karşılaştır"
