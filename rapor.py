@@ -272,6 +272,8 @@ def _prune_events():
 
 def _skip_reason(msg):
     m = (msg or "").lower()
+    if "yön sınırı" in m:
+        return "aynı yön sınırı"
     if "sınır" in m:
         return "pozisyon sınırı"
     if "zaten açık" in m:
