@@ -35,6 +35,7 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "").strip()
 MARGIN_USDT = 1000.0          # her işlemde kullanılacak teminat
 LOSS_PCT_OF_MARGIN = 0.30     # SL'de teminatın %30'u kaybedilir (1000 $ → 300 $)
 MAX_OPEN_POSITIONS = 4        # aynı anda en fazla kaç pozisyon
+MAX_SAME_DIRECTION = 2        # aynı yönde (LONG ya da SHORT) en fazla kaç pozisyon – coinler BTC ile birlikte hareket eder
 MAX_LEVERAGE = 50             # coinin izni daha yüksek olsa bile bu sınırı aşma
 MAX_PRICE_DIFF_PCT = 1.0      # Gate sinyal fiyatı ile Binance fiyatı bundan fazla farklıysa işlem açma
 TRIM_TOLERANCE = 0.02         # gerçek SL zararı hedefi %2'den fazla aşarsa fazlası kapatılır
@@ -45,6 +46,7 @@ PARTIAL_SIZE = 0.5            # kısmi kârda pozisyonun ne kadarı kapanır (%5
 MAX_HOLD_CANDLES = {"15m": 16, "1h": 24}   # 15m: 4 saat, 1h: 24 saat
 DEFAULT_HOLD_CANDLES = 24                  # listede olmayan zaman dilimleri için
 AFTER_PARTIAL_MULT = 2                     # yarı kâr alındıysa kalan yarıya süre × 2 (0 = süre sınırı yok)
+STRUCTURE_EXIT = True                      # yapı bozulursa kapat: işlemin zaman diliminde mum EMA26'nın ters tarafında kapanırsa
 TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400,
               "8h": 28800, "1d": 86400}
 
@@ -430,6 +432,39 @@ def _watch_untracked(rows, plans, notify):
     os.replace(tmp, WATCH_FILE)
 
 
+def _structure_broken(symbol, plan):
+    """
+    İşlemin zaman diliminde YENİ kapanan mum EMA26'nın ters tarafında mı kapandı?
+    LONG: kapanış < EMA26, SHORT: kapanış > EMA26 → açıklama metni. Değilse None.
+    Her mum için bir kez kontrol eder (plan["struct_checked"]).
+    """
+    import pandas as pd
+    import signal_bot as sb                      # indikatörler giriş kararındakiyle aynı hesaplanır
+    tf = plan.get("tf") or "1h"
+    sec = TF_SECONDS.get(tf, 3600)
+    last_open = int(time.time()) // sec * sec - sec           # son kapanmış mumun açılışı
+    if plan.get("struct_checked", 0) >= last_open:
+        return None
+    plan["struct_checked"] = last_open
+    if last_open + sec <= plan["opened_ms"] / 1000:          # mum, işlem açılmadan önce kapanmış
+        return None
+    rows = _request("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": tf, "limit": 200}, signed=False)
+    df = pd.DataFrame([[int(r[0]) // 1000, float(r[1]), float(r[2]), float(r[3]), float(r[4])] for r in rows],
+                      columns=["ts", "open", "high", "low", "close"])
+    if len(df) < 40:
+        return None
+    sb.compute_indicators(df)
+    hit = df.index[df["ts"] == last_open]
+    idx = int(hit[0]) if len(hit) else len(df) - 2
+    e26, close = float(df["ema_26"][idx]), float(df["close"][idx])
+    # Yapı bozuldu: mum EMA26'nın ters tarafında kapandı
+    if plan["side"] == "AL" and close < e26:
+        return f"{tf} mum EMA26'nın altında kapandı ({close:g} < {e26:.6g})"
+    if plan["side"] == "SAT" and close > e26:
+        return f"{tf} mum EMA26'nın üstünde kapandı ({close:g} > {e26:.6g})"
+    return None
+
+
 def manage_positions(notify):
     """
     Her çalıştırmada (dakikada bir) çağrılır:
@@ -497,6 +532,39 @@ def manage_positions(notify):
             changed = True
             continue
 
+        # Yapı bozulması: sadece yarı kârı alınmamış işlemlerde
+        partial_taken = plan["be_done"] and plan.get("half", 0) > 0
+        if STRUCTURE_EXIT and not partial_taken:
+            before = plan.get("struct_checked")
+            try:
+                broken = _structure_broken(symbol, plan)
+            except Exception as e:
+                print(f"  {symbol}: yapı kontrolü yapılamadı ({e})")
+                broken = None
+            if plan.get("struct_checked") != before:
+                changed = True
+            if broken:
+                amt_str = f"{amt:.{_decimals(plan['step'])}f}"
+                try:
+                    _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
+                except Exception as e:
+                    notify(f"❌ {symbol}: yapı bozuldu ama pozisyon kapatılamadı – ELLE KONTROL ET! ({e})")
+                    continue
+                time.sleep(1.5)
+                _cancel_all(symbol)
+                net = _realized_since(symbol, plan["opened_ms"] - 5000)
+                res = "sonuç okunamadı" if net is None else f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
+                hours = (time.time() - plan["opened_ms"] / 1000) / 3600
+                tf_ = plan.get("tf") or "1h"
+                icon = "📉" if plan["side"] == "AL" else "📈"
+                yon = "LONG" if plan["side"] == "AL" else "SHORT"
+                notify(f"{icon} {symbol}: yapı bozuldu – {broken}, {yon} kapatıldı "
+                       f"({hours:.1f} saat) – {res}")
+                _record_close(symbol, plan, net, "YAPI", notify)
+                del plans[symbol]
+                changed = True
+                continue
+
         # Zaman sınırı
         tf = plan.get("tf") or "1h"
         candles = MAX_HOLD_CANDLES.get(tf, DEFAULT_HOLD_CANDLES)
@@ -543,7 +611,10 @@ def _time_note(timeframe):
         return ""
     h = candles * TF_SECONDS.get(tf, 3600) / 3600
     after = f"yarı kâr alınırsa {h * AFTER_PARTIAL_MULT:g} saat" if AFTER_PARTIAL_MULT else "yarı kâr alınırsa süre sınırı yok"
-    return f"\n⏰ Süre sınırı: {h:g} saat ({candles} mum), {after}"
+    note = f"\n⏰ Süre sınırı: {h:g} saat ({candles} mum), {after}"
+    if STRUCTURE_EXIT:
+        note += f"\n🧱 {tf} mum EMA26'nın ters tarafında kapanırsa (yarı kârdan önce) kapanır"
+    return note
 
 
 def open_trade(gate_symbol, alert, timeframe=None):
@@ -563,6 +634,12 @@ def open_trade(gate_symbol, alert, timeframe=None):
         return False, f"⏭ {symbol}: zaten açık pozisyon var, yeni işlem açılmadı."
     if len(positions) >= MAX_OPEN_POSITIONS:
         return False, f"⏭ {symbol}: {len(positions)} açık pozisyon var (sınır {MAX_OPEN_POSITIONS}), işlem açılmadı."
+    want_long = side == "AL"
+    same = [p["symbol"] for p in positions if (float(p["positionAmt"]) > 0) == want_long]
+    if MAX_SAME_DIRECTION and len(same) >= MAX_SAME_DIRECTION:
+        yon = "LONG" if want_long else "SHORT"
+        return False, (f"⏭ {symbol}: aynı yönde {len(same)} {yon} var ({', '.join(same)}; "
+                       f"yön sınırı {MAX_SAME_DIRECTION}), işlem açılmadı.")
     avail = _available_usdt()
     if avail < MARGIN_USDT * 1.05:
         return False, f"⏭ {symbol}: kullanılabilir bakiye yetersiz ({avail:.0f} USDT)."
