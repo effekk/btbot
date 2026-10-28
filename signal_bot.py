@@ -52,6 +52,7 @@ STOP_LOOKBACK = 10        # stop seviyesi: son kaç kapanmış mumun dibi / tepe
 ATR_PERIOD = 14           # ATR: bir mumun ortalama hareket genişliği (normal dalgalanma)
 STOP_BUFFER_ATR = 0.5     # stop, dibin/tepenin bu kadar ATR ötesine konur (fitile karşı pay)
 MIN_STOP_ATR = 1.0        # stop girişe en az bu kadar ATR uzak olmalı (daha yakınsa genişletilir)
+TP_R = 1.5                # TP, stop mesafesinin kaç katı uzakta (1.5 = 1:1,5). Önceden 2.0
 MAX_STOP_ATR = 4.0        # stop bundan uzaksa risk çok büyük: sinyal gönderilmez
 CANDLE_LIMIT = 200
 
@@ -304,12 +305,12 @@ def check_alert(df, buy_src, sell_src, htf_trend, min_indicators=MIN_INDICATORS)
         swing = float(df["low"][lo:i + 1].min())
         risk = max(entry - (swing - STOP_BUFFER_ATR * a), MIN_STOP_ATR * a)
         stop = entry - risk
-        target = entry + 2 * risk
+        target = entry + TP_R * risk
     else:
         swing = float(df["high"][lo:i + 1].max())
         risk = max((swing + STOP_BUFFER_ATR * a) - entry, MIN_STOP_ATR * a)
         stop = entry + risk
-        target = entry - 2 * risk
+        target = entry - TP_R * risk
     if risk > MAX_STOP_ATR * a:
         print(f"  sinyal atlandı: stop çok uzak ({risk / a:.1f} ATR, %{risk / entry * 100:.2f})")
         return None
@@ -342,7 +343,7 @@ def alert_text(symbol, timeframe, a):
         f"Sinyal: {'+'.join(a['sources'])}",
         f"Trend {timeframe}: {a['trend']}" + (f" | {htf}: {a['htf_trend'] or '-'}" if htf else ""),
         f"🛑 SL: {fmt_price(a['stop'])} → zarar: -%{a['risk_pct']:.2f}",
-        f"🎯 TP (1:2): {fmt_price(a['target'])} → kâr: +%{2 * a['risk_pct']:.2f}",
+        f"🎯 TP (1:{TP_R:g}): {fmt_price(a['target'])} → kâr: +%{TP_R * a['risk_pct']:.2f}",
         f"Stop mesafesi: {a['risk_atr']:.1f} ATR (1 ATR = %{a['atr_pct']:.2f})",
         "(yüzdeler sinyal fiyatından girildiğinde, kaldıraçsız)",
     ]
