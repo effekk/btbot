@@ -504,11 +504,22 @@ def main():
 
     state = load_state()
     state.setdefault("last_scan", {})
+
+    # Uzaktan durum isteği: ayarlar.env'deki RAPOR_ISTEGI değeri değişince bir kez
+    # test mesajı (trendler + Binance durumu) ve günün raporu gönderilir. SSH gerekmez.
+    remote_req = os.environ.get("RAPOR_ISTEGI", "").strip().strip('"').strip("'")
+    remote = bool(remote_req) and state.get("last_remote_request") != remote_req
+    if remote:
+        state["last_remote_request"] = remote_req
+        save_state(state)
+        print(f"Uzaktan durum isteği alındı ({remote_req})")
+    test_mode = TEST_RUN or remote
+
     if TRADING_ENABLED:
         import binance_trader
         binance_trader.manage_positions(send_telegram)   # yarı kâr → SL girişe, kapanış bildirimi
         import rapor
-        rapor.maybe_send_daily(send_telegram, binance_trader.daily_numbers, force=REPORT_NOW)
+        rapor.maybe_send_daily(send_telegram, binance_trader.daily_numbers, force=REPORT_NOW or remote)
         rapor.maybe_send_weekly(send_telegram, binance_trader.status_line, force=REPORT_NOW)
         if REPORT_NOW:
             print("Rapor gönderildi.")
@@ -520,7 +531,7 @@ def main():
     for tf in TIMEFRAMES:
         closed = last_closed_open_ts(tf, now_ts)
         # Bu zaman diliminde yeni bir mum kapanmadıysa atla (test çalıştırmasında hepsi taranır)
-        if not TEST_RUN and state["last_scan"].get(tf, 0) >= closed:
+        if not test_mode and state["last_scan"].get(tf, 0) >= closed:
             print(f"{tf}: yeni mum kapanmadı, atlandı")
             continue
         n_err = len(errors)
@@ -531,8 +542,8 @@ def main():
 
     now = datetime.datetime.now(TZ).strftime("%d.%m %H:%M")
     total = len(SYMBOLS) * len(scanned)
-    if TEST_RUN:
-        msg = [f"✅ Test: sinyal botu çalışıyor ({now})",
+    if test_mode:
+        msg = [f"✅ {'Durum raporu' if remote and not TEST_RUN else 'Test'}: sinyal botu çalışıyor ({now})",
                f"Zaman dilimleri: {', '.join(scanned)} | {len(SYMBOLS)} coin | "
                f"{total - len(errors)}/{total} tarama başarılı | {sent} sinyal gönderildi"]
         if TRADING_ENABLED:
@@ -540,6 +551,21 @@ def main():
             msg += ["", binance_trader.status_line()]
         else:
             msg += ["", f"ℹ️ Otomatik işlem KAPALI (TRADING_ENABLED={os.environ.get('TRADING_ENABLED', 'tanımsız')!r})"]
+        # Zaman dilimine göre trend dağılımı (sinyal yoksa sebebi genelde burada görünür)
+        dist = {}
+        for line in report:
+            try:
+                head = line.split(" / ")[0]                 # "BTC_USDT 15m: YATAY"
+                tf_part, trend = head.split(": ")
+                tf_name = tf_part.split()[-1]
+                dist.setdefault(tf_name, {}).setdefault(trend, 0)
+                dist[tf_name][trend] += 1
+            except ValueError:
+                continue
+        if dist:
+            msg += ["", "Trend dağılımı:"] + [
+                f"  {k}: " + " · ".join(f"{t} {n}" for t, n in sorted(v.items(), key=lambda kv: -kv[1]))
+                for k, v in dist.items()]
         msg += ["", "Trendler:"] + report
         if errors:
             msg += ["", "Hatalar:"] + errors
