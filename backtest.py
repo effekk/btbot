@@ -57,6 +57,10 @@ AYAR_AY = 8                   # ilk 8 ay: ayar / karşılaştırma; kalan 4 ay: 
 ISINMA_AY = 2                 # indikatörler için öncesinden fazladan indirilen ay
 KOMISYON = 0.0005             # taker %0,05
 MAX_DAKIKA = 30 * 1440        # bir işlem en fazla 30 gün izlenir (sonra "SON" ile kapanır)
+UFUK_MUM = 16                 # çıkıştan bağımsız MFE/MAE: girişten sonraki 16 mum (işlemin zaman diliminde)
+# Giriş anındaki bağlam bilgileri (işlem kayıtlarına ve CSV'ye yazılır)
+BAGLAM = ["risk_atr", "stop_pct", "trend_guc", "ema26_uzaklik", "rsi", "atr_pct",
+          "htf_trend", "htf_guc", "btc_trend", "btc_htf_trend"]
 
 SURE_SONU = 48                # süreç başladıktan bu kadar saniye sonra backtest bu dakikalık işini bırakır
 MIN_KALAN = 10                # yeni bir iş birimine başlamak için gereken en az süre (sn)
@@ -354,7 +358,7 @@ def _sonraki_asama(d, notify):
         say, tfsay = 0, {}
         for _, b in d["semboller"]:
             for tf in sb.TIMEFRAMES:
-                n = len(_json_oku(os.path.join(SINYAL, f"{b}_{tf}.json"), []) or [])
+                n = len((_json_oku(os.path.join(SINYAL, f"{b}_{tf}.json"), {}) or {}).get("sinyaller", []))
                 say += n
                 tfsay[tf] = tfsay.get(tf, 0) + n
         notify(f"📶 Backtest: sinyaller hesaplandı – {say} sinyal (" +
@@ -444,6 +448,36 @@ def _indikatorlu(bsym, tf):
 # =========================================================================
 # 2) Sinyaller (botun check_alert'i, 200 mumluk pencere)
 # =========================================================================
+def _trend_okuyucu(bsym, tf):
+    """T anında son KAPANMIŞ mumun trendi (botun market_state'i) ve gücü |EMA12-EMA26|/ATR."""
+    if not tf:
+        return lambda T: (None, None)
+    try:
+        t, _, kol = _indikatorlu(bsym, tf)
+    except Exception:
+        return lambda T: ("VERİ YOK", None)
+    sec = SEC[tf]
+    tam = _Pencere(kol, 0, len(t))
+    onbellek = {}
+
+    def oku(T):
+        j_open = T // sec * sec - sec
+        j = int(np.searchsorted(t, j_open))
+        if j >= len(t) or t[j] != j_open or j < 199:
+            return "VERİ YOK", None                        # filtre uygulanamıyorsa sinyal geçmez
+        if j not in onbellek:
+            a = kol["atr"][j]
+            guc = float(abs(kol["ema_12"][j] - kol["ema_26"][j]) / a) if a > 0 else None
+            onbellek[j] = (sb.market_state(tam, j)[0], guc)
+        return onbellek[j]
+    return oku
+
+
+def _sayi(x, basamak=3):
+    x = float(x)
+    return round(x, basamak) if math.isfinite(x) else None
+
+
 def _b_sinyal(d, b):
     bsym, tf = b
     os.makedirs(SINYAL, exist_ok=True)
@@ -453,46 +487,85 @@ def _b_sinyal(d, b):
     n = len(t)
 
     htf = sb.HIGHER_TF.get(tf)
-    htrend = {}
-    if htf:
-        ht, _, hkol = _indikatorlu(bsym, htf)
-        hsec = SEC[htf]
-        htam = _Pencere(hkol, 0, len(ht))
-
-    def htf_trend(T):
-        if not htf:
-            return None
-        j_open = T // hsec * hsec - hsec                   # sinyal anında son kapanmış üst mum
-        j = int(np.searchsorted(ht, j_open))
-        if j >= len(ht) or ht[j] != j_open or j < 199:
-            return "VERİ YOK"                              # filtre uygulanamıyorsa sinyal geçmez
-        if j not in htrend:
-            htrend[j] = sb.market_state(htam, j)[0]
-        return htrend[j]
+    htf_oku = _trend_okuyucu(bsym, htf)
+    btc = _bsym("BTC_USDT")
+    btc_oku = _trend_okuyucu(btc, tf)
+    btc_htf_oku = _trend_okuyucu(btc, htf)
 
     bas = _ay_bas_ts(d["test_aylar"][0])
     son = _ay_son_ts(d["test_aylar"][-1])
+    sinir = _ay_bas_ts(d["dogrulama_aylar"][0])
     gecici = os.path.join(SINYAL, f"{bsym}_{tf}.yarim.json")
-    liste = (_json_oku(gecici, []) or []) if d["alt"] else []
+    kayit = (_json_oku(gecici, {}) or {}) if d["alt"] else {}
+    liste = kayit.get("sinyaller", [])
+    ham = kayit.get("ham", {})                              # sadece ayar dönemi: kaynak-yön → eleme nedeni → sayı
+
+    def say(anahtar, neden):
+        ham.setdefault(anahtar, {})
+        ham[anahtar][neden] = ham[anahtar].get(neden, 0) + 1
+
     i0 = max(199, d["alt"])
     with contextlib.redirect_stdout(io.StringIO()):         # check_alert'in "stop çok uzak" yazıları
         for i in range(i0, n - 1):
             if (i - i0) % 400 == 0 and i > i0 and _kalan() < 3:
                 d["alt"] = i
-                _json_yaz(gecici, liste)
+                _json_yaz(gecici, {"sinyaller": liste, "ham": ham})
                 return False
-            if bool(buy[i]) == bool(sell[i]):
+            al, sat = buy[i], sell[i]
+            if not al and not sat:
                 continue
             T = int(t[i]) + sec                            # sinyal mumunun kapanışı = giriş anı
             if T < bas or T >= son or int(t[i + 1]) != T:
                 continue
+            egitim = T < sinir
+            if al and sat:
+                if egitim:
+                    for k in al:
+                        say(f"{k} AL", "çelişkili")
+                    for k in sat:
+                        say(f"{k} SAT", "çelişkili")
+                continue
+            side = "AL" if al else "SAT"
             a = i - 198                                     # canlıdaki gibi 200 mum: son kapanmış = n-2
-            alert = sb.check_alert(_Pencere(kol, a, i + 2), buy[a:i + 2], sell[a:i + 2], htf_trend(T))
+            pencere = _Pencere(kol, a, i + 2)
+            htf_t = htf_oku(T)[0] if htf else None
+            alert = sb.check_alert(pencere, buy[a:i + 2], sell[a:i + 2], htf_t)
+            if egitim:
+                # Eleme nedeni: karar check_alert'in; neden, onun sırasıyla (trend → üst ZD → stop) belirlenir
+                if alert:
+                    neden = "GEÇTİ"
+                else:
+                    istenen = "YÜKSELİŞ" if side == "AL" else "DÜŞÜŞ"
+                    trend = sb.market_state(pencere, 198)[0]
+                    if trend == "YATAY":
+                        neden = "trend yatay"
+                    elif trend != istenen:
+                        neden = "trend ters"
+                    elif htf_t == "VERİ YOK":
+                        neden = "üst ZD veri yok"
+                    elif htf_t is not None and htf_t != istenen:
+                        neden = "üst ZD yatay" if htf_t == "YATAY" else "üst ZD ters"
+                    else:
+                        neden = "stop >4 ATR"
+                for k in (al or sat):
+                    say(f"{k} {side}", neden)
             if alert:
-                liste.append({"T": T, "tf": tf, "sym": bsym, "side": alert["side"],
-                              "entry": float(alert["entry"]), "stop": float(alert["stop"]),
-                              "src": "+".join(alert["sources"]), "risk_atr": round(float(alert["risk_atr"]), 2)})
-    _json_yaz(os.path.join(SINYAL, f"{bsym}_{tf}.json"), liste)
+                s = 1 if side == "AL" else -1
+                c, atr_ = float(kol["close"][i]), float(kol["atr"][i])
+                e12, e26, rsi_ = float(kol["ema_12"][i]), float(kol["ema_26"][i]), float(kol["rsi"][i])
+                entry, stop = float(alert["entry"]), float(alert["stop"])
+                liste.append({
+                    "T": T, "tf": tf, "sym": bsym, "side": side, "entry": entry, "stop": stop,
+                    "src": "+".join(alert["sources"]), "risk_atr": _sayi(alert["risk_atr"], 2),
+                    "stop_pct": _sayi(abs(entry - stop) / entry * 100),
+                    "trend_guc": _sayi(abs(e12 - e26) / atr_),
+                    "ema26_uzaklik": _sayi(s * (c - e26) / atr_),      # + = trend yönünde EMA26'dan uzakta
+                    "rsi": _sayi(rsi_, 1),
+                    "atr_pct": _sayi(atr_ / c * 100),
+                    "htf_trend": htf_t, "htf_guc": _sayi(htf_oku(T)[1]) if htf and htf_oku(T)[1] is not None else None,
+                    "btc_trend": btc_oku(T)[0], "btc_htf_trend": btc_htf_oku(T)[0] if htf else None,
+                })
+    _json_yaz(os.path.join(SINYAL, f"{bsym}_{tf}.json"), {"sinyaller": liste, "ham": ham})
     if os.path.exists(gecici):
         os.remove(gecici)
     return True
@@ -603,7 +676,39 @@ def _islem(sig, v, T1, O, H, L, C, yapi):
     net = pnl - ucret
     return {"sym": sig["sym"], "tf": tf, "side": sig["side"], "T": T, "cikis_t": cikis_t, "cikis": cikis,
             "kismi": kismi, "net": round(net, 2), "risk": round(risk_usdt, 2), "r": round(net / risk_usdt, 4),
+            "brut": round(pnl, 2), "kom": round(ucret, 2), "r_brut": round(pnl / risk_usdt, 4),
+            "kom_r": round(ucret / risk_usdt, 4),
             "mfe": round(mfe, 3), "lev": lev, "dk": (cikis_t - T) // 60, "src": sig["src"]}
+
+
+def _sabit_ufuk(sig, T1, On, Hn, Ln):
+    """
+    Çıkış kuralından bağımsız: girişten sonraki UFUK_MUM mum (işlemin zaman diliminde) boyunca
+    fiyatın lehimize (MFE) ve aleyhimize (MAE) en fazla ne kadar gittiği, R cinsinden
+    (1R = giriş fiyatı ile SL arası). ilk1r: +1R'ye mi -1R'ye (SL) mi önce değdi; aynı dakikada ise zarar.
+    """
+    k0 = int(np.searchsorted(T1, sig["T"]))
+    if k0 >= len(T1) or T1[k0] != sig["T"]:
+        return {}
+    fill = float(On[k0])
+    dist = abs(fill - sig["stop"])
+    if dist <= 0:
+        return {}
+    k1 = k0 + UFUK_MUM * SEC[sig["tf"]] // 60
+    h, l = Hn[k0:k1], Ln[k0:k1]
+    if sig["side"] == "AL":
+        lehte, aleyhte = (h - fill) / dist, (fill - l) / dist
+    else:
+        lehte, aleyhte = (fill - l) / dist, (h - fill) / dist
+    kar = np.flatnonzero(lehte >= 1)
+    zarar = np.flatnonzero(aleyhte >= 1)
+    if not len(kar) and not len(zarar):
+        ilk = "yok"
+    elif not len(zarar) or (len(kar) and kar[0] < zarar[0]):
+        ilk = "kâr"
+    else:
+        ilk = "zarar"
+    return {"mfe16": round(float(lehte.max()), 3), "mae16": round(float(aleyhte.max()), 3), "ilk1r": ilk}
 
 
 def _b_simule(d, b):
@@ -611,7 +716,7 @@ def _b_simule(d, b):
     os.makedirs(SONUC, exist_ok=True)
     sinyaller = []
     for tf in sb.TIMEFRAMES:
-        sinyaller += _json_oku(os.path.join(SINYAL, f"{bsym}_{tf}.json"), []) or []
+        sinyaller += (_json_oku(os.path.join(SINYAL, f"{bsym}_{tf}.json"), {}) or {}).get("sinyaller", [])
     hedef = os.path.join(SONUC, f"{bsym}.json")
     gecici = hedef + ".yarim"
     sonuc = (_json_oku(gecici, []) or []) if d["alt"] else []
@@ -619,6 +724,7 @@ def _b_simule(d, b):
         m = _yukle(bsym, "1m")
         T1 = m["t"]
         O, H, L, C = m["o"].tolist(), m["h"].tolist(), m["l"].tolist(), m["c"].tolist()
+        On, Hn, Ln = m["o"], m["h"], m["l"]
         yapi = {}
         for tf in {s_["tf"] for s_ in sinyaller}:
             v = _yukle(bsym, tf)
@@ -630,11 +736,15 @@ def _b_simule(d, b):
                 d["alt"] = j
                 _json_yaz(gecici, sonuc)
                 return False
+            sig = sinyaller[j]
+            ek = {k: sig.get(k) for k in BAGLAM}
+            ek.update(_sabit_ufuk(sig, T1, On, Hn, Ln))
             for v in VARYANTLAR:
-                r = _islem(sinyaller[j], v, T1, O, H, L, C, yapi[sinyaller[j]["tf"]])
+                r = _islem(sig, v, T1, O, H, L, C, yapi[sig["tf"]])
                 r["var"] = v["kod"]
                 if "atla" in r:
-                    r.update({"sym": bsym, "tf": sinyaller[j]["tf"], "T": sinyaller[j]["T"]})
+                    r.update({"sym": bsym, "tf": sig["tf"], "T": sig["T"], "side": sig["side"], "src": sig["src"]})
+                r.update(ek)
                 sonuc.append(r)
     _json_yaz(hedef, sonuc)
     if os.path.exists(gecici):
@@ -684,6 +794,13 @@ def _ist(tr, aylar):
     s["pf"] = float(net[net > 0].sum() / -kayip) if kayip < 0 else float("inf")
     s["kazanma"] = float((net > 0).mean())
     s["net"] = float(net.sum())
+    brut = np.array([x["brut"] for x in tr])
+    s["r_brut"] = float(np.mean([x["r_brut"] for x in tr]))
+    s["kom_r"] = float(np.mean([x["kom_r"] for x in tr]))
+    s["kom_usdt"] = float(np.sum([x["kom"] for x in tr]))
+    bk = brut[brut <= 0].sum()
+    s["pf_brut"] = float(brut[brut > 0].sum() / -bk) if bk < 0 else float("inf")
+    s["kazanma_brut"] = float((brut > 0).mean())
     kap = sorted(tr, key=lambda x: x["cikis_t"])
     s["dd"] = _dd([x["net"] for x in kap])
     s["dd_r"] = _dd([x["r"] for x in kap])
@@ -713,7 +830,9 @@ def _ozet(ad, s):
         return f"{ad}: işlem yok"
     return (f"{ad}: {s['n']} işlem | {_r(s['ort_r'])}/işlem (%95 GA {_r(s['ga'][0])} … {_r(s['ga'][1])}) | "
             f"PF {_f2(s['pf'])} | kazanma {_pct(s['kazanma'])} | net {_usd(s['net'])} USDT | "
-            f"en büyük düşüş {_usd(-s['dd'])} USDT ({_f2(s['dd_r'])}R) | kârlı ay {s['karli_ay']}/{s['ay_say']}")
+            f"en büyük düşüş {_usd(-s['dd'])} USDT ({_f2(s['dd_r'])}R) | kârlı ay {s['karli_ay']}/{s['ay_say']}"
+            f"\n   komisyonsuz: {_r(s['r_brut'])}/işlem | PF {_f2(s['pf_brut'])} | kazanma {_pct(s['kazanma_brut'])}"
+            f" · komisyon payı {_r(-s['kom_r'])}/işlem (toplam {_usd(-s['kom_usdt'])} USDT)")
 
 
 def _kisa(ad, tr):
@@ -721,10 +840,12 @@ def _kisa(ad, tr):
         return f"  {ad}: işlem yok"
     r = np.array([x["r"] for x in tr])
     net = np.array([x["net"] for x in tr])
-    kayip = net[net <= 0].sum()
+    brut = np.array([x["brut"] for x in tr])
+    kayip, bk = net[net <= 0].sum(), brut[brut <= 0].sum()
     pf = net[net > 0].sum() / -kayip if kayip < 0 else float("inf")
-    return (f"  {ad}: {len(tr)} işlem | {_r(r.mean())}/işlem | PF {_f2(pf)} | kazanma {_pct((net > 0).mean())} | "
-            f"net {_usd(net.sum())}")
+    pfb = brut[brut > 0].sum() / -bk if bk < 0 else float("inf")
+    return (f"  {ad}: {len(tr)} işlem | {_r(r.mean())}/işlem (komisyonsuz {_r(np.mean([x['r_brut'] for x in tr]))}) | "
+            f"PF {_f2(pf)} (komisyonsuz {_f2(pfb)}) | kazanma {_pct((net > 0).mean())} | net {_usd(net.sum())}")
 
 
 def _dokum(tr, s):
@@ -788,6 +909,149 @@ def _monte_carlo(tr, ufuklar):
                 seriler.append(en)
         out.append((u, float(np.percentile(np.concatenate(dds), 95)), int(np.percentile(seriler, 95))))
     return out
+
+
+# ---- Giriş analizi (sadece ayar dönemi, sınırsız: her sinyal bağımsız işlem) ----
+def _grup(g):
+    """Bir sinyal grubunun özeti: A kurallarıyla R (komisyonlu/komisyonsuz) + çıkıştan bağımsız ölçüler."""
+    r = np.mean([x["r"] for x in g])
+    rb = np.mean([x["r_brut"] for x in g])
+    u = [x for x in g if x.get("ilk1r")]
+    kar = sum(x["ilk1r"] == "kâr" for x in u) / len(u) if u else None
+    zar = sum(x["ilk1r"] == "zarar" for x in u) / len(u) if u else None
+    mfe = np.median([x["mfe16"] for x in u]) if u else None
+    mae = np.median([x["mae16"] for x in u]) if u else None
+    return (f"{len(g)} | {_r(r)} (kom.suz {_r(rb)}) | önce +1R {_pct(kar)} / önce −1R {_pct(zar)} | "
+            f"MFE16 med {_f2(mfe)} · MAE16 med {_f2(mae)}")
+
+
+def _sayisal_tablo(ad, tr, anahtar):
+    deger = [(x[anahtar], x) for x in tr if x.get(anahtar) is not None]
+    if len(deger) < 40:
+        return []
+    v = np.array([a for a, _ in deger], float)
+    kenar = list(np.unique(np.round(np.percentile(v, [25, 50, 75]), 3)))
+    sinirlar = [-float("inf")] + kenar + [float("inf")]
+    satir = [f"  {ad}:"]
+    for a, b in zip(sinirlar[:-1], sinirlar[1:]):
+        g = [x for val, x in deger if a <= val < b]
+        if not g:
+            continue
+        etiket = f"< {_f2(b)}" if not math.isfinite(a) else (f"≥ {_f2(a)}" if not math.isfinite(b) else f"{_f2(a)}–{_f2(b)}")
+        satir.append(f"   {etiket}: {_grup(g)}")
+    return satir
+
+
+def _kategori_tablo(ad, tr, fonk, en_az=15):
+    gruplar = {}
+    for x in tr:
+        gruplar.setdefault(fonk(x), []).append(x)
+    satir = [f"  {ad}:"]
+    for k, g in sorted(gruplar.items(), key=lambda kv: -len(kv[1])):
+        if len(g) >= en_az:
+            satir.append(f"   {k}: {_grup(g)}")
+    kucuk = sum(len(g) for g in gruplar.values() if len(g) < en_az)
+    if kucuk:
+        satir.append(f"   (≤{en_az - 1} sinyalli gruplar: toplam {kucuk})")
+    return satir
+
+
+def _iliski(x, alan):
+    t = x.get(alan)
+    istenen = "YÜKSELİŞ" if x["side"] == "AL" else "DÜŞÜŞ"
+    if t in (None, "VERİ YOK"):
+        return "veri yok"
+    return "aynı yön" if t == istenen else ("yatay" if t == "YATAY" else "ters yön")
+
+
+def _dagilim(ad, degerler):
+    m = np.array(degerler, float)
+    kovalar = [(0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0), (1.0, 1.5), (1.5, 2.0), (2.0, 3.0), (3.0, float("inf"))]
+    satir = [f"  {ad} ({len(m)} sinyal): medyan {_f2(float(np.median(m)))}R"]
+    for a, b in kovalar:
+        oran = float(((m >= a) & (m < b)).mean())
+        etiket = f"{_f2(a)}–{_f2(b)}R" if math.isfinite(b) else f"≥{_f2(a)}R"
+        satir.append(f"   {etiket}: {_pct(oran)} {'█' * int(round(oran * 40))}")
+    return satir
+
+
+def _giris_analizi(d, hepsi, sinir, port):
+    ayar_bag = {v["kod"]: [x for x in hepsi if x["var"] == v["kod"] and "atla" not in x and x["T"] < sinir]
+                for v in VARYANTLAR}
+    a_tr = ayar_bag["A"]
+    satir = ["", "6) GİRİŞ ANALİZİ – sadece ayar dönemi, pozisyon sınırı YOK (her sinyal bağımsız işlem)",
+             "   (doğrulama dönemine bilerek bakılmıyor; girişler burada sorgulanıp değiştirilecek)"]
+
+    # 6a: sınırsız sonuçlar
+    satir.append("6a) Varyantlar, tüm sinyaller bağımsız:")
+    for v in VARYANTLAR:
+        satir.append(_ozet(f"{v['kod']} {v['ad']}", _ist(ayar_bag[v["kod"]], d["ayar_aylar"])))
+    alinan_a = {(x["sym"], x["tf"], x["T"]) for x in port["A"][0]}
+    ali = [x for x in a_tr if (x["sym"], x["tf"], x["T"]) in alinan_a]
+    atl = [x for x in a_tr if (x["sym"], x["tf"], x["T"]) not in alinan_a]
+    satir.append("  A – portföyde alınanlar ile sınır yüzünden atlananlar:")
+    satir.append(_kisa("alınan", ali))
+    satir.append(_kisa("atlanan", atl))
+    if not a_tr:
+        return satir
+
+    # 6b: çıkıştan bağımsız MFE / MAE
+    u = [x for x in a_tr if x.get("ilk1r")]
+    satir += ["", f"6b) Çıkıştan bağımsız: girişten sonraki {UFUK_MUM} mum (işlemin zaman diliminde), 1R = giriş–SL mesafesi"]
+    if u:
+        kar = [x for x in u if x["ilk1r"] == "kâr"]
+        zar = [x for x in u if x["ilk1r"] == "zarar"]
+        satir.append(f"  Önce +1R'ye değen {_pct(len(kar) / len(u))} · önce SL'ye (−1R) değen {_pct(len(zar) / len(u))} · "
+                     f"ikisine de değmeyen {_pct(1 - (len(kar) + len(zar)) / len(u))}")
+        satir += _dagilim(f"MFE{UFUK_MUM} (en yüksek lehte hareket)", [x["mfe16"] for x in u])
+        satir += _dagilim(f"MAE{UFUK_MUM} (en derin ters hareket)", [x["mae16"] for x in u])
+        if kar:
+            yuz = np.percentile([x["mae16"] for x in kar], [50, 75, 90])
+            satir.append(f"  Önce +1R'ye değenlerin ters hareketi (MAE): %50'si ≤{_f2(yuz[0])}R, %75'i ≤{_f2(yuz[1])}R, "
+                         f"%90'ı ≤{_f2(yuz[2])}R")
+        if zar:
+            sonra = sum(x["mfe16"] >= 1 for x in zar) / len(zar)
+            satir.append(f"  Önce SL'ye değenlerin {_pct(sonra)}'i aynı {UFUK_MUM} mumda sonra +1R'ye de gitti (stop dar mı?)")
+        for tf in sb.TIMEFRAMES:
+            for yon, ad in (("AL", "LONG"), ("SAT", "SHORT")):
+                g = [x for x in u if x["tf"] == tf and x["side"] == yon]
+                if g:
+                    satir.append(f"   {tf} {ad}: {_grup(g)}")
+
+    # 6c: giriş anındaki bağlam
+    satir += ["", "6c) Giriş anındaki bağlama göre (A kurallarıyla R; çeyreklik dilimler)",
+              "   sütunlar: sinyal | R/işlem (komisyonsuz) | 16 mumda önce +1R / önce −1R | MFE16 · MAE16 medyan"]
+    satir += _sayisal_tablo("Stop mesafesi (ATR)", a_tr, "risk_atr")
+    satir += _sayisal_tablo("Stop mesafesi (%)", a_tr, "stop_pct")
+    satir += _sayisal_tablo("Trend gücü |EMA12−EMA26|/ATR", a_tr, "trend_guc")
+    satir += _sayisal_tablo("EMA26'ya uzaklık (ATR, + = trend yönünde)", a_tr, "ema26_uzaklik")
+    satir += _sayisal_tablo("RSI", a_tr, "rsi")
+    satir += _sayisal_tablo("Volatilite (ATR %)", a_tr, "atr_pct")
+    satir += _sayisal_tablo("Üst ZD trend gücü |EMA12−EMA26|/ATR", a_tr, "htf_guc")
+    satir += _kategori_tablo("BTC trendi (aynı zaman dilimi)", a_tr, lambda x: _iliski(x, "btc_trend"))
+    satir += _kategori_tablo("BTC trendi (üst zaman dilimi)", a_tr, lambda x: _iliski(x, "btc_htf_trend"))
+    satir += _kategori_tablo("Sinyal kaynağı", a_tr, lambda x: f"{x['src']} {'LONG' if x['side'] == 'AL' else 'SHORT'}")
+    satir += _kategori_tablo("Saat (TR)", a_tr, lambda x: f"{(int(_ts_str(x['T'])[11:13]) // 4) * 4:02d}–"
+                                                         f"{(int(_ts_str(x['T'])[11:13]) // 4) * 4 + 4:02d}")
+
+    # 6d: ham sinyaller ve eleme nedenleri
+    satir += ["", "6d) Ham sinyaller ve filtreler (bir mumda birden çok kaynak varsa her birine sayılır)"]
+    nedenler = ["çelişkili", "trend yatay", "trend ters", "üst ZD yatay", "üst ZD ters", "üst ZD veri yok",
+                "stop >4 ATR", "GEÇTİ"]
+    for tf in sb.TIMEFRAMES:
+        top = {}
+        for _, bs in d["semboller"]:
+            ham = (_json_oku(os.path.join(SINYAL, f"{bs}_{tf}.json"), {}) or {}).get("ham", {})
+            for k, nd in ham.items():
+                for n_, c in nd.items():
+                    top.setdefault(k, {})
+                    top[k][n_] = top[k].get(n_, 0) + c
+        satir.append(f"  {tf}:")
+        for k in sorted(top, key=lambda k: (k.split()[0], k.split()[1])):
+            toplam = sum(top[k].values())
+            parca = " · ".join(f"{n_} {top[k][n_]} ({_pct(top[k][n_] / toplam)})" for n_ in nedenler if top[k].get(n_))
+            satir.append(f"   {k}: {toplam} ham → {parca}")
+    return satir
 
 
 def _b_rapor(d, b):
@@ -877,9 +1141,12 @@ def _b_rapor(d, b):
                      f" | %95 kayıp serisi {seri95}")
     satir.append("  Canlıda düşüş, aynı işlem sayısındaki %95 düşüşü aşarsa: dur ve birlikte bakalım.")
 
+    satir += _giris_analizi(d, hepsi, sinir, port)
+
     satir += ["", "Notlar:",
               "- Canlı sinyaller Gate.io spot verisinden geliyor; backtest Binance Futures verisini kullanıyor (fiyatlar çok yakın ama aynı değil).",
               "- Kayma, funding, kaldıraç kademesi (leverage bracket) ve bakiye yetersizliği hesaba katılmadı.",
+              "- 'Komisyonsuz' değerler aynı işlemlerin komisyon düşülmeden önceki sonucudur (giriş+çıkış taker %0,05).",
               "- İndikatörler tüm geçmişten hesaplandı; 200 mumluk canlı pencereyle fark ihmal edilebilir düzeyde (EMA/RSI başlangıç etkisi).",
               f"- Ayrıntılı işlem listesi CSV dosyasında. Süre: {(time.time() - d['baslangic']) / 60:.0f} dk."]
     if d["hatalar"]:
@@ -899,7 +1166,8 @@ def _b_rapor(d, b):
     with open(csv_yol, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["varyant", "donem", "sembol", "tf", "yon", "giris_zamani", "cikis_zamani", "cikis", "yari_kar",
-                    "net_usdt", "risk_usdt", "r", "mfe_r", "kaldirac", "sure_dk", "sinyal"])
+                    "net_usdt", "brut_usdt", "komisyon_usdt", "risk_usdt", "r", "r_komisyonsuz", "mfe_r",
+                    "kaldirac", "sure_dk", "sinyal"] + BAGLAM + ["mfe16_r", "mae16_r", "ilk_1r"])
         for v in VARYANTLAR:
             for x in sorted(port[v["kod"]][0], key=lambda x: x["T"]):
                 dogr = x["T"] >= sinir
@@ -907,12 +1175,42 @@ def _b_rapor(d, b):
                     continue                                   # seçilmeyen varyantların doğrulaması hiç açılmaz
                 w.writerow([v["kod"], "dogrulama" if dogr else "ayar", x["sym"], x["tf"],
                             "LONG" if x["side"] == "AL" else "SHORT", _ts_str(x["T"]), _ts_str(x["cikis_t"]),
-                            x["cikis"], int(x["kismi"]), x["net"], x["risk"], x["r"], x["mfe"], x["lev"], x["dk"], x["src"]])
+                            x["cikis"], int(x["kismi"]), x["net"], x["brut"], x["kom"], x["risk"], x["r"], x["r_brut"],
+                            x["mfe"], x["lev"], x["dk"], x["src"]] + [x.get(k) for k in BAGLAM]
+                           + [x.get("mfe16"), x.get("mae16"), x.get("ilk1r")])
+
+    # Ayar dönemindeki TÜM sinyaller (pozisyon sınırı olmadan), her varyantın bağımsız sonucuyla
+    sinyal_yol = os.path.join(CALISMA, f"bt_sinyaller_ayar_{d['istek']}.csv")
+    alinmis = {v["kod"]: {(x["sym"], x["tf"], x["T"]) for x in port[v["kod"]][0]} for v in VARYANTLAR}
+    satirlar = {}
+    for x in hepsi:
+        if x["T"] >= sinir:
+            continue
+        anahtar = (x["sym"], x["tf"], x["T"])
+        satirlar.setdefault(anahtar, {})[x["var"]] = x
+    with open(sinyal_yol, "w", newline="") as f:
+        w = csv.writer(f)
+        bas = ["sembol", "tf", "yon", "giris_zamani", "sinyal"] + BAGLAM + ["mfe16_r", "mae16_r", "ilk_1r"]
+        for v in VARYANTLAR:
+            k = v["kod"]
+            bas += [f"{k}_r", f"{k}_r_komisyonsuz", f"{k}_cikis", f"{k}_portfoyde_alindi"]
+        w.writerow(bas)
+        for anahtar in sorted(satirlar, key=lambda a: (a[2], a[1], a[0])):
+            g = satirlar[anahtar]
+            x = g.get("A") or next(iter(g.values()))
+            satir_ = [x["sym"], x["tf"], "LONG" if x.get("side") == "AL" else "SHORT", _ts_str(x["T"]), x.get("src")]
+            satir_ += [x.get(k) for k in BAGLAM] + [x.get("mfe16"), x.get("mae16"), x.get("ilk1r")]
+            for v in VARYANTLAR:
+                y = g.get(v["kod"], {})
+                if "atla" in y or not y:
+                    satir_ += ["", "", y.get("atla", ""), 0]
+                else:
+                    satir_ += [y["r"], y["r_brut"], y["cikis"], int(anahtar in alinmis[v["kod"]])]
+            w.writerow(satir_)
 
     notify = _NOTIFY[0]
     _gonder(notify, metin)
     _belge_gonder(rapor_yol, f"Backtest raporu (istek {d['istek']})")
-    _belge_gonder(csv_yol, "İşlemler (ayar: tüm varyantlar, doğrulama: sadece seçilen)")
+    _belge_gonder(csv_yol, "Portföyde alınan işlemler (ayar: tüm varyantlar, doğrulama: sadece seçilen)")
+    _belge_gonder(sinyal_yol, "Ayar dönemindeki tüm sinyaller, pozisyon sınırı olmadan (bağlam + MFE/MAE + her varyantın sonucu)")
     return True
-
-
