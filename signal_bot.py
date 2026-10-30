@@ -584,6 +584,7 @@ def main():
             backtest.adim(send_telegram)
         except Exception as e:
             print(f"Backtest adımı hata verdi: {e}")
+          
     if total and len(errors) == total:
         sys.exit(1)   # hepsi başarısızsa GitHub da e-posta ile haber verir
 
