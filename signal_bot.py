@@ -577,6 +577,13 @@ def main():
 
     save_state(state)
     print(f"Bitti: taranan {scanned}, {sent} sinyal, {len(errors)} hata")
+      # Backtest: ayarlar.env'deki BACKTEST_ISTEGI değişince başlar, canlı işten sonra kalan sürede ilerler
+    if not TEST_RUN:
+        try:
+            import backtest
+            backtest.adim(send_telegram)
+        except Exception as e:
+            print(f"Backtest adımı hata verdi: {e}")
     if total and len(errors) == total:
         sys.exit(1)   # hepsi başarısızsa GitHub da e-posta ile haber verir
 
