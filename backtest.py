@@ -21,7 +21,11 @@ Varsayımlar:
 TREND MODLARI: GIRIS_MODU=trend_1d ya da trend_4h ise iki mod birlikte, 3 yıllık 4h/1d mumlarla,
   trend çıkışıyla (stop + signal_bot.trend_exit) test edilir; ayrıntı dosyanın sonundaki TREND bölümünde.
 
+KRİPTO DIŞI: BACKTEST_VERI=dukascopy ise trend_4h kuralları Dukascopy'den indirilen 10 piyasada (metal, enerji,
+  endeks, döviz) test edilir ve kripto trend_4h portföyüyle birleştirilir; ayrıntı dosyanın sonundaki KRİPTO DIŞI bölümünde.
+
 ayarlar.env:
+  BACKTEST_VERI     – boş: kripto (Binance verisi); dukascopy: kripto dışı 10 piyasa
   BACKTEST_ISTEGI   – değişince yeni backtest başlar
   DOGRULAMA_GOSTER  – false/tanımsız: son 4 ay hiç hesaplanmaz, sadece ayar dönemi; true: doğrulama da yapılır
   GIRIS_MODU        – signal_bot.py'deki giriş fikri; raporun başına yazılır
@@ -278,8 +282,15 @@ def _trend_mi():
     return _giris_modu() in TREND_MODLAR
 
 
+def _veri_turu():
+    """ayarlar.env BACKTEST_VERI: boş = kripto (Binance), dukascopy = kripto dışı 10 piyasa (Dukascopy)."""
+    return os.environ.get("BACKTEST_VERI", "").strip().strip('"').strip("'").strip().lower()
+
+
 def _is_modu():
     """Yeni backtest tetikleme anahtarı: iki trend modu tek karşılaştırma işidir."""
+    if _veri_turu() == "dukascopy":
+        return "dukascopy"
     return "trend" if _trend_mi() else _giris_modu()
 
 
@@ -315,6 +326,8 @@ def adim(notify):
 
 
 def _yeni_is(istek, notify):
+    if _veri_turu() == "dukascopy":
+        return _k_yeni_is(istek, notify)
     simdi = datetime.datetime.now(datetime.timezone.utc)
     son = None
     for geri in (1, 2, 3):
@@ -352,6 +365,8 @@ def _yeni_is(istek, notify):
 
 
 def _birimler(d):
+    if d.get("kd"):
+        return _k_birimler(d)
     ok = [s for s in d["semboller"] if s[1] not in d["atlanan_coin"]]
     if d.get("trend") and d["asama"] == "sinyal":
         return [(b, m) for _, b in ok for m in d["modlar"]]
@@ -374,7 +389,9 @@ def _bir_birim(d, notify):
     b = birimler[d["sira"]]
     anahtar = d["asama"] + "|" + "|".join(b)
     try:
-        if d.get("trend"):
+        if d.get("kd"):
+            islev = {"indir": _k_indir, "sinyal": _k_sinyal, "simule": _k_simule, "rapor": _k_rapor}
+        elif d.get("trend"):
             islev = {"indir": _b_indir, "sinyal": _t_sinyal, "simule": _t_simule, "rapor": _t_rapor}
         else:
             islev = {"indir": _b_indir, "sinyal": _b_sinyal, "simule": _b_simule, "rapor": _b_rapor}
@@ -385,7 +402,9 @@ def _bir_birim(d, notify):
         print(f"Backtest hata ({anahtar}, deneme {n}): {e}")
         if n >= 3:
             d["hatalar"].append(f"{anahtar}: {e}"[:300])
-            if d["asama"] == "indir" and b[1] == d.get("ana_tf", "1m"):
+            if d.get("kd") and d["asama"] == "indir":
+                d.setdefault("indirilemeyen", []).append(f"{b[0]} {b[1]}: {e}"[:200])
+            elif d["asama"] == "indir" and b[1] == d.get("ana_tf", "1m"):
                 d["atlanan_coin"].append(b[0])          # ana veri yoksa coin tamamen dışarıda kalır
             elif d["asama"] == "rapor":
                 notify(f"❌ Backtest raporu oluşturulamadı: {e}")
@@ -402,6 +421,8 @@ def _bir_birim(d, notify):
 
 
 def _sonraki_asama(d, notify):
+    if d.get("kd"):
+        return _k_sonraki_asama(d, notify)
     a = d["asama"]
     gecen = (time.time() - d["baslangic"]) / 60
     if a == "indir":
@@ -1959,4 +1980,597 @@ def _t_rapor(d, b):
     _gonder(notify, metin)
     _belge_gonder(rapor_yol, f"Trend backtest raporu (istek {d['istek']})")
     _belge_gonder(csv_yol, "Tüm sinyaller (sınırsız) – portfoyde_alindi sütunu portföy sınırlarıyla alınanları gösterir")
+    return True
+
+
+# =========================================================================
+# KRİPTO DIŞI (BACKTEST_VERI=dukascopy): trend_4h kuralları 10 piyasada
+#   Plan önceden kayıtlı; piyasa listesi, maliyetler ve kurallar burada sabit, tarama yok.
+#   - Veri: dukascopy-python (4.0.1) ile Dukascopy'den 2023-01-01'den bugüne 4h ve 1d, bid, UTC.
+#     bt_calisma/veri_dukascopy içine kaydedilir, varsa tekrar indirilmez.
+#     Hacmi 0 ve high == low olan mumlar (piyasa kapalıyken veri akışının ürettiği düz mumlar) atılır.
+#   - Kurallar: signal_bot.py trend_4h (compute_indicators / compute_signals / check_alert,
+#     üst ZD 1d market_state, çıkış trend_exit "dc10", stop 2,5 ATR) – kripto testindeki kopyayla aynı yükleme.
+#   - Giriş: sinyal mumundan sonraki mevcut 4h mumun açılışı. Stop mum içinde → stop fiyatı;
+#     mum stopun ötesinde açıldıysa (hafta sonu boşluğu) açılış. trend_exit → o mumun kapanışı. Aynı mumda önce stop.
+#   - Maliyet: spread işlem başına bir kez (sabit); swap her UTC gece yarısı için pozisyon değerinin
+#     yıllık %5'i / 365 (long ve short maliyet); komisyon yok.
+#   - Pozisyon: her işlem 1R = 100 USDT; her piyasada aynı anda en fazla 1 pozisyon; başka sınır yok.
+#   - Dönem: geliştirme 2023-10 – 2026-05; sonrası doğrulama (DOGRULAMA_GOSTER=false iken hiç hesaplanmaz).
+#     Geliştirme işlemi doğrulama başlarken açıksa ilk mumun açılışından kapatılır (DÖNEM).
+# =========================================================================
+KD_PIYASALAR = [
+    # (rapor adı, Dukascopy adı, dukascopy-python 4.0.1'deki karşılığı, grup, spread (fiyat birimi))
+    ("ALTIN", "XAU/USD", "XAU/USD", "metaller", 0.30),
+    ("GUMUS", "XAG/USD", "XAG/USD", "metaller", 0.03),
+    ("PETROL", "LIGHT.CMD", "E_Light", "enerji", 0.04),
+    ("SP500", "USA500.IDX", "E_SandP-500", "endeksler", 0.6),
+    ("NASDAQ", "USATECH.IDX", "E_NQ-100", "endeksler", 1.5),
+    ("DAX", "DEU.IDX", "E_DAAX", "endeksler", 1.5),
+    ("EURUSD", "EUR/USD", "EUR/USD", "döviz", 0.00008),
+    ("GBPUSD", "GBP/USD", "GBP/USD", "döviz", 0.00012),
+    ("USDJPY", "USD/JPY", "USD/JPY", "döviz", 0.010),
+    ("AUDUSD", "AUD/USD", "AUD/USD", "döviz", 0.00010),
+]
+KD_GRUPLAR = ["metaller", "enerji", "endeksler", "döviz"]
+KD_BASLANGIC = "2023-01-01"
+KD_GELISTIRME = ("2023-10", "2026-05")
+KD_SWAP_YILLIK = 0.05
+KD_R_USDT = 100.0
+KD_TFLER = {"4h": "INTERVAL_HOUR_4", "1d": "INTERVAL_DAY_1"}
+KD_VERI = os.path.join(CALISMA, "veri_dukascopy")
+KD_SONUC = os.path.join(CALISMA, "sonuclar_kd")
+KD_KRIPTO_ISTEK = "7"                        # kripto trend_4h portföyü: bt_islemler_7_trend.csv
+KD_BOOT = 20000
+KD_MOD = "trend_4h"
+
+
+def _k_bilgi(piyasa):
+    return next(x for x in KD_PIYASALAR if x[0] == piyasa)
+
+
+def _k_yeni_is(istek, notify):
+    simdi = datetime.datetime.now(datetime.timezone.utc)
+    son_ay = f"{simdi.year}-{simdi.month:02d}"
+    gel, dog = [], []
+    y, m = map(int, KD_GELISTIRME[0].split("-"))
+    while f"{y}-{m:02d}" <= son_ay:
+        (gel if f"{y}-{m:02d}" <= KD_GELISTIRME[1] else dog).append(f"{y}-{m:02d}")
+        y, m = _ay_kaydir(y, m, 1)
+    d = {
+        "istek": istek, "asama": "indir", "sira": 0, "alt": 0, "baslangic": time.time(), "kd": True,
+        "piyasalar": [p_[0] for p_ in KD_PIYASALAR], "ayar_aylar": gel, "dogrulama_aylar": dog,
+        "test_aylar": gel + dog, "bitis": simdi.strftime("%Y-%m-%d"),
+        "hatalar": [], "deneme": {}, "eksik": {}, "atlanan_coin": [], "indirilemeyen": [],
+        "giris_modu": _giris_modu(), "is_modu": "dukascopy", "dogrulama": _dogrulama_ayari(),
+    }
+    notify("\n".join([
+        f"🧪 Kripto dışı backtest başladı (istek {istek}) – kurallar: signal_bot.py {KD_MOD}",
+        "Piyasalar: " + ", ".join(f"{p_[0]} ({p_[1]})" for p_ in KD_PIYASALAR),
+        f"Veri: Dukascopy 4h + 1d, bid, UTC, {KD_BASLANGIC} – bugün",
+        f"Geliştirme: {gel[0]} – {gel[-1]} ({len(gel)} ay) | Doğrulama: "
+        + ((f"{dog[0]} – {dog[-1]}" if dog else "yok") if d["dogrulama"] else "KAPALI (hiç hesaplanmayacak)"),
+        "Maliyet: sabit spread (işlem başına bir kez), swap gece başına yıllık %5, komisyon yok. 1R = 100 USDT.",
+        "Birleşik portföy: + kripto trend_4h portföyü (istek " + KD_KRIPTO_ISTEK + ").",
+    ]))
+    return d
+
+
+def _k_birimler(d):
+    if d["asama"] == "indir":
+        return [(p_, tf) for p_ in d["piyasalar"] for tf in KD_TFLER]
+    if d["asama"] == "sinyal":
+        return [(p_, "kd") for p_ in d["piyasalar"]]
+    if d["asama"] == "simule":
+        return [(p_,) for p_ in d["piyasalar"]]
+    if d["asama"] == "rapor":
+        return [("rapor",)]
+    return []
+
+
+def _k_sonraki_asama(d, notify):
+    a = d["asama"]
+    gecen = (time.time() - d["baslangic"]) / 60
+    if a == "indir":
+        if d.get("indirilemeyen"):
+            notify("\n".join([
+                f"⚠️ Kripto dışı backtest (istek {d['istek']}) DURDURULDU: şu veriler indirilemedi:",
+                *[f"- {x}" for x in d["indirilemeyen"]],
+                "Plan gereği hiçbir piyasa listeden çıkarılmadı ve karar verilmedi. Nasıl devam edelim?",
+                f"(Sadece yeniden denemek istersen {ISTEK_DEGISKENI} değerini değiştir; indirilen veriler saklı.)",
+            ]))
+            d["asama"] = "bitti"
+        else:
+            satir = [f"📥 Kripto dışı veri hazır ({len(d['piyasalar'])} piyasa, {gecen:.0f} dk)"]
+            for p_ in d["piyasalar"]:
+                bilgi = []
+                for tf in KD_TFLER:
+                    v = _k_yukle(p_, tf)
+                    bilgi.append(f"{tf} {len(v['t'])} mum ({_ts_str(int(v['t'][0]))[:10]} – {_ts_str(int(v['t'][-1]))[:10]})")
+                satir.append(f"  {p_}: " + " · ".join(bilgi))
+            notify("\n".join(satir))
+            d["asama"] = "sinyal"
+    elif a == "sinyal":
+        say = sum(len((_json_oku(os.path.join(SINYAL, f"kd_{p_}.json"), {}) or {}).get("sinyaller", []))
+                  for p_ in d["piyasalar"])
+        notify(f"📶 Kripto dışı: sinyaller hesaplandı – {say} sinyal, {gecen:.0f} dk. Şimdi çıkışlar işletiliyor.")
+        d["asama"] = "simule"
+    elif a == "simule":
+        d["asama"] = "rapor"
+    elif a == "rapor":
+        d["asama"] = "bitti"
+    d["sira"] = 0
+    d["alt"] = 0
+
+
+# ---- Veri ----
+def _k_veri_yolu(piyasa, tf):
+    return os.path.join(KD_VERI, f"{piyasa}_{tf}.csv")
+
+
+class _ZamanAsimli:
+    """dukascopy-python requests.get'i zaman aşımısız çağırıyor; takılıp canlı botu bekletmesin diye 12 sn sınır."""
+
+    def __init__(self, modul):
+        self._m = modul
+
+    def __getattr__(self, ad):
+        return getattr(self._m, ad)
+
+    def get(self, *a, **kw):
+        kw.setdefault("timeout", 12)
+        return self._m.get(*a, **kw)
+
+
+def _k_indir(d, b):
+    piyasa, tf = b
+    os.makedirs(KD_VERI, exist_ok=True)
+    yol = _k_veri_yolu(piyasa, tf)
+    if os.path.exists(yol):
+        return True                                   # bir kez indirilen veri tekrar indirilmez
+    if _kalan() < 25:
+        return False                                  # bir sonraki dakikada, yeterli süre varken dene
+    try:
+        import dukascopy_python as dp
+    except Exception as e:
+        raise RuntimeError(f"dukascopy-python yüklü değil ({e}); requirements.txt'ye dukascopy-python==4.0.1 ekle")
+    import requests as _rq
+    dp.requests = _ZamanAsimli(_rq)
+    _, _, kod, _, _ = _k_bilgi(piyasa)
+    bas = datetime.datetime.fromisoformat(KD_BASLANGIC).replace(tzinfo=datetime.timezone.utc)
+    son = datetime.datetime.now(datetime.timezone.utc)
+    df = dp.fetch(kod, getattr(dp, KD_TFLER[tf]), dp.OFFER_SIDE_BID, bas, son, max_retries=0)
+    if df is None or len(df) < 100:
+        raise RuntimeError(f"Dukascopy'den yeterli mum gelmedi ({0 if df is None else len(df)} satır)")
+    df = df.reset_index()
+    t = (pd.to_datetime(df["timestamp"], utc=True) - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)
+    out = pd.DataFrame({"t": t, "open": df["open"].astype(float), "high": df["high"].astype(float),
+                        "low": df["low"].astype(float), "close": df["close"].astype(float),
+                        "volume": df["volume"].astype(float)})
+    out = out.drop_duplicates("t").sort_values("t")
+    tmp = yol + ".tmp"
+    out.to_csv(tmp, index=False)
+    os.replace(tmp, yol)
+    return True
+
+
+def _k_yukle(piyasa, tf):
+    """Kaydedilmiş veri; piyasa kapalıyken üretilen düz mumlar (hacim 0, high == low) atılır."""
+    df = pd.read_csv(_k_veri_yolu(piyasa, tf))
+    df = df[~((df["volume"] <= 0) & (df["high"] <= df["low"]))]
+    df = df.dropna().reset_index(drop=True)
+    return {"t": df["t"].to_numpy(np.int64), "o": df["open"].to_numpy(float), "h": df["high"].to_numpy(float),
+            "l": df["low"].to_numpy(float), "c": df["close"].to_numpy(float)}
+
+
+def _k_df(m, piyasa, tf):
+    v = _k_yukle(piyasa, tf)
+    df = pd.DataFrame({
+        "datetime": pd.to_datetime(v["t"], unit="s", utc=True).tz_convert(rapor.TZ).tz_localize(None),
+        "open": v["o"], "high": v["h"], "low": v["l"], "close": v["c"], "volume": np.zeros(len(v["t"])),
+    })
+    m.compute_indicators(df)
+    return v, df
+
+
+# ---- Sinyaller ----
+def _k_sinyal(d, b):
+    piyasa = b[0]
+    os.makedirs(SINYAL, exist_ok=True)
+    m = _sb_mod(KD_MOD)
+    v, df = _k_df(m, piyasa, "4h")
+    dv, ddf = _k_df(m, piyasa, "1d")
+    t, dt = v["t"], dv["t"]
+    buy, sell = m.compute_signals(df)
+    gun_onb = {}
+
+    def gunluk_trend(T_kapanis):
+        j = int(np.searchsorted(dt + 86400, T_kapanis, side="right")) - 1   # T anında kapanmış son 1d mum
+        if j < 39:
+            return "VERİ YOK"
+        if j not in gun_onb:
+            a = max(0, j - 198)
+            gun_onb[j] = m.market_state(_pencere_df(ddf, a, j + 2), j - a)[0]
+        return gun_onb[j]
+
+    bas = _ay_bas_ts(d["ayar_aylar"][0])
+    sinir = _ay_bas_ts(d["dogrulama_aylar"][0]) if d["dogrulama_aylar"] else 2 ** 62
+    son = 2 ** 62 if d.get("dogrulama", True) else sinir
+    liste, ham = [], {"sinyal mumu": 0, "çelişkili": 0, "check_alert eledi": 0, "GEÇTİ": 0}
+    with contextlib.redirect_stdout(io.StringIO()):
+        for i in range(39, len(t) - 1):
+            al, sat = buy[i], sell[i]
+            if not al and not sat:
+                continue
+            T = int(t[i + 1])                              # giriş: bir sonraki mevcut mumun açılışı
+            if T < bas or T >= son:
+                continue
+            egitim = T < sinir
+            if egitim:
+                ham["sinyal mumu"] += 1
+            if al and sat:
+                ham["çelişkili"] += egitim
+                continue
+            a = max(0, i - 198)
+            hb = gunluk_trend(int(t[i]) + SEC["4h"])
+            alert = m.check_alert(_pencere_df(df, a, i + 2), list(buy[a:i + 2]), list(sell[a:i + 2]), hb)
+            if not alert:
+                ham["check_alert eledi"] += egitim
+                continue
+            if alert.get("exit_mode") != "trend":
+                raise RuntimeError(f"check_alert exit_mode='trend' döndürmüyor ({alert.get('exit_mode')!r})")
+            ham["GEÇTİ"] += egitim
+            liste.append({"T": T, "i": i, "sym": piyasa, "tf": "4h", "side": alert["side"],
+                          "entry": float(alert["entry"]), "stop": float(alert["stop"]),
+                          "src": "+".join(alert.get("sources") or [KD_MOD]),
+                          "exit_rule": _kodla(alert.get("exit_rule")), "htf_trend": hb})
+    _json_yaz(os.path.join(SINYAL, f"kd_{piyasa}.json"), {"sinyaller": liste, "ham": ham})
+    return True
+
+
+# ---- İşlemler ----
+def _k_islem(sig, m, v, df, sinir, spread):
+    t, O, H, L, C = v["t"], v["o"], v["h"], v["l"], v["c"]
+    s = 1 if sig["side"] == "AL" else -1
+    k0 = int(sig["i"]) + 1
+    if k0 >= len(t) or int(t[k0]) != sig["T"]:
+        return {"atla": "veri yok"}
+    fill = float(O[k0])
+    sl = float(sig["stop"])
+    if s * (fill - sl) <= 0:
+        return {"atla": "fiyat stopun ötesinde açıldı"}
+    dist = abs(fill - sl)
+    rule = _coz(sig.get("exit_rule"))
+    kesim = sinir if sig["T"] < sinir else None
+    mfe = 0.0
+    k = k0
+    while True:
+        if kesim is not None and t[k] >= kesim:
+            px, cikis, cikis_t = float(O[k]), "DÖNEM", int(t[k])
+            break
+        op, hi, lo, cl = float(O[k]), float(H[k]), float(L[k]), float(C[k])
+        if (s == 1 and lo <= sl) or (s == -1 and hi >= sl):
+            bosluk = s * (op - sl) <= 0
+            px, cikis = (op if bosluk else sl), "SL"
+            cikis_t = int(t[k]) + (0 if bosluk else SEC["4h"] // 2)
+            break
+        mfe = max(mfe, ((hi - fill) if s == 1 else (fill - lo)) / dist)
+        a = max(0, k - 198)
+        if m.trend_exit(_pencere_df(df, a, k + 2), k - a, sig["side"], rule) is not None:
+            px, cikis, cikis_t = cl, "İZ", int(t[k]) + SEC["4h"]
+            break
+        if k >= len(t) - 1:
+            px, cikis, cikis_t = cl, "SON", int(t[k]) + SEC["4h"]
+            break
+        k += 1
+    geceler = int(cikis_t // 86400 - sig["T"] // 86400)     # geçilen UTC gece yarısı sayısı
+    r_brut = s * (px - fill) / dist
+    r_spread = spread / dist
+    r_swap = geceler * KD_SWAP_YILLIK / 365 * fill / dist
+    r = r_brut - r_spread - r_swap
+    return {"sym": sig["sym"], "tf": "4h", "side": sig["side"], "T": sig["T"], "cikis_t": cikis_t, "cikis": cikis,
+            "giris_px": fill, "cikis_px": px, "stop": sl, "r_brut": round(r_brut, 4), "r_spread": round(r_spread, 4),
+            "r_swap": round(r_swap, 4), "r": round(r, 4), "net": round(r * KD_R_USDT, 2), "geceler": geceler,
+            "mfe": round(mfe, 3), "dk": int((cikis_t - sig["T"]) // 60), "src": sig["src"],
+            "stop_atr": None, "stop_pct": round(dist / fill * 100, 3)}
+
+
+def _k_simule(d, b):
+    piyasa = b[0]
+    os.makedirs(KD_SONUC, exist_ok=True)
+    m = _sb_mod(KD_MOD)
+    v, df = _k_df(m, piyasa, "4h")
+    sinyaller = (_json_oku(os.path.join(SINYAL, f"kd_{piyasa}.json"), {}) or {}).get("sinyaller", [])
+    sinir = _ay_bas_ts(d["dogrulama_aylar"][0]) if d["dogrulama_aylar"] else 2 ** 62
+    spread = _k_bilgi(piyasa)[4]
+    sonuc, acik_bitis, atlanan = [], -1, 0
+    with contextlib.redirect_stdout(io.StringIO()):
+        for sig in sorted(sinyaller, key=lambda x: x["T"]):
+            if sig["T"] < acik_bitis:                      # bu piyasada açık pozisyon var
+                atlanan += 1
+                continue
+            r = _k_islem(sig, m, v, df, sinir, spread)
+            if "atla" in r:
+                continue
+            r["grup"] = _k_bilgi(piyasa)[3]
+            sonuc.append(r)
+            acik_bitis = r["cikis_t"]
+    _json_yaz(os.path.join(KD_SONUC, f"{piyasa}.json"), {"islemler": sonuc, "acik_varken_atlanan": atlanan})
+    return True
+
+
+# ---- İstatistik ----
+def _k_ceyrek(ts):
+    y, m = map(int, _ts_ay(ts).split("-"))
+    return f"{y}-Ç{(m - 1) // 3 + 1}"
+
+
+def _k_blok_ga(tr, aylar, seed=5):
+    """Aylık blok bootstrap: ayları (içindeki tüm işlemlerle) yerine koyarak çek; işlem başına ortalama R'nin %95 aralığı."""
+    if not tr:
+        return None
+    idx = {a: i for i, a in enumerate(aylar)}
+    top = np.zeros(len(aylar))
+    say = np.zeros(len(aylar))
+    for x in tr:
+        i = idx.get(_ts_ay(x["T"]))
+        if i is not None:
+            top[i] += x["r"]
+            say[i] += 1
+    rng = np.random.default_rng(seed)
+    secim = rng.integers(0, len(aylar), (KD_BOOT, len(aylar)))
+    t_, s_ = top[secim].sum(1), say[secim].sum(1)
+    ort = t_[s_ > 0] / s_[s_ > 0]
+    return float(np.percentile(ort, 2.5)), float(np.percentile(ort, 97.5))
+
+
+def _k_ist(tr, aylar):
+    s = {"n": len(tr)}
+    if not tr:
+        return s
+    r = np.array([x["r"] for x in tr])
+    s["ort_r"] = float(r.mean())
+    s["toplam_r"] = float(r.sum())
+    kay = r[r <= 0].sum()
+    s["pf"] = float(r[r > 0].sum() / -kay) if kay < 0 else float("inf")
+    s["kazanma"] = float((r > 0).mean())
+    s["ga"] = _k_blok_ga(tr, aylar)
+    kap = sorted(tr, key=lambda x: x["cikis_t"])
+    s["dd_r"] = _dd([x["r"] for x in kap])
+    cey = {}
+    for a in aylar:
+        cey.setdefault(_k_ceyrek(_ay_bas_ts(a)), 0.0)
+    for x in tr:
+        cey[_k_ceyrek(x["T"])] = cey.get(_k_ceyrek(x["T"]), 0.0) + x["r"]
+    s["ceyrekler"] = cey
+    s["karli_ceyrek"] = sum(1 for v_ in cey.values() if v_ > 0)
+    s["ceyrek_say"] = len(cey)
+    kaz = sorted((v_ for v_ in r if v_ > 0), reverse=True)
+    s["top5"] = float(sum(kaz[:5]))
+    s["top5_kazanc"] = s["top5"] / sum(kaz) if kaz else None
+    s["top5_net"] = s["top5"] / s["toplam_r"] if s["toplam_r"] > 0 else None
+    for yon, ad in (("AL", "long"), ("SAT", "short")):
+        g = [x["r"] for x in tr if x["side"] == yon]
+        s[f"{ad}_n"] = len(g)
+        s[f"{ad}_ort"] = float(np.mean(g)) if g else None
+        s[f"{ad}_top"] = float(np.sum(g)) if g else 0.0
+    s["spread_r"] = float(np.mean([x.get("r_spread", 0.0) for x in tr]))
+    s["swap_r"] = float(np.mean([x.get("r_swap", 0.0) for x in tr]))
+    s["kom_r"] = float(np.mean([x.get("r_kom", 0.0) for x in tr]))
+    s["brut_r"] = float(np.mean([x["r_brut"] for x in tr]))
+    s["ort_gun"] = float(np.mean([x["dk"] for x in tr])) / 1440
+    return s
+
+
+def _k_kural(s):
+    if not s["n"]:
+        return [], False
+    k = [
+        ("Ortalama ≥ +0,10R", s["ort_r"] >= KARAR_ORT_R, _r(s["ort_r"])),
+        ("Aylık blok bootstrap %95 GA alt sınırı > 0", s["ga"] is not None and s["ga"][0] > 0,
+         _r(s["ga"][0]) if s["ga"] else "–"),
+        (f"Kâr faktörü ≥ {_f2(KARAR_PF)}", s["pf"] >= KARAR_PF, _f2(s["pf"])),
+        (f"Kârlı çeyrek ≥ %{KARAR_KARLI_AY * 100:.0f}",
+         s["karli_ceyrek"] >= math.ceil(KARAR_KARLI_AY * s["ceyrek_say"] - 1e-9), f"{s['karli_ceyrek']}/{s['ceyrek_say']}"),
+    ]
+    return k, all(x[1] for x in k)
+
+
+def _k_satir(ad, s):
+    if not s["n"]:
+        return [f"{ad}: işlem yok"]
+    ga = f"{_r(s['ga'][0])} … {_r(s['ga'][1])}" if s["ga"] else "–"
+    return [
+        f"{ad}: {s['n']} işlem | {_r(s['ort_r'])}/işlem (aylık blok %95 GA {ga}) | PF {_f2(s['pf'])} | "
+        f"kazanma {_pct(s['kazanma'])} | toplam {_r(s['toplam_r'])} ({_usd(s['toplam_r'] * KD_R_USDT)} USDT) | "
+        f"en büyük düşüş {_f2(s['dd_r'])}R ({_usd(-s['dd_r'] * KD_R_USDT)} USDT) | kârlı çeyrek {s['karli_ceyrek']}/{s['ceyrek_say']}",
+        f"   LONG {s['long_n']} işlem {_r(s['long_ort'])}/işlem · SHORT {s['short_n']} işlem {_r(s['short_ort'])}/işlem | "
+        f"en büyük 5 kazanç {_r(s['top5'])} = kazançların {_pct(s['top5_kazanc'])}'i, net kârın "
+        f"{_pct(s['top5_net']) if s['top5_net'] is not None else '– (net ≤ 0)'}'i",
+        f"   maliyet payı: spread {_r(-s['spread_r'])}/işlem · swap {_r(-s['swap_r'])}/işlem"
+        + (f" · komisyon {_r(-s['kom_r'])}/işlem" if s["kom_r"] else "")
+        + f" | maliyetsiz {_r(s['brut_r'])}/işlem | ort. süre {_f2(s['ort_gun'])} gün",
+    ]
+
+
+def _k_kripto(d, sinir_bas, sinir_son):
+    """İstek 7'deki kripto trend_4h portföy işlemleri (geliştirme dönemi, portföyde alınanlar)."""
+    yol = os.path.join(CALISMA, f"bt_islemler_{KD_KRIPTO_ISTEK}_trend.csv")
+    if not os.path.exists(yol):
+        return None, f"{os.path.basename(yol)} bulunamadı"
+    df = pd.read_csv(yol)
+    df = df[(df["mod"] == KD_MOD) & (df["donem"] == "gelistirme") & (df["portfoyde_alindi"] == 1)]
+    tr = []
+    for _, x in df.iterrows():
+        T = int(pd.Timestamp(x["giris_zamani"]).tz_localize(rapor.TZ).timestamp())
+        Tc = int(pd.Timestamp(x["cikis_zamani"]).tz_localize(rapor.TZ).timestamp())
+        if not (sinir_bas <= T < sinir_son):
+            continue
+        r_kom = float(x["r_komisyonsuz"]) - float(x["r"])
+        r_fund = float(x["r"]) - float(x["r_funding_dahil"])
+        tr.append({"sym": x["sembol"], "grup": "kripto", "side": "AL" if x["yon"] == "LONG" else "SAT",
+                   "T": T, "cikis_t": Tc, "cikis": x["cikis"], "r": float(x["r_funding_dahil"]),
+                   "r_kom_dahil": float(x["r"]), "r_brut": float(x["r_komisyonsuz"]), "r_kom": r_kom,
+                   "r_swap": r_fund, "r_spread": 0.0, "dk": int((Tc - T) // 60)})
+    return tr, None
+
+
+def _k_rapor(d, b):
+    aylar = d["ayar_aylar"]
+    sinir = _ay_bas_ts(d["dogrulama_aylar"][0]) if d["dogrulama_aylar"] else 2 ** 62
+    bas = _ay_bas_ts(aylar[0])
+    dogr_acik = d.get("dogrulama", True) and bool(d["dogrulama_aylar"])
+    hepsi, atl = [], {}
+    for p_ in d["piyasalar"]:
+        j = _json_oku(os.path.join(KD_SONUC, f"{p_}.json"), {}) or {}
+        hepsi += j.get("islemler", [])
+        atl[p_] = j.get("acik_varken_atlanan", 0)
+    gel = [x for x in hepsi if x["T"] < sinir]
+    dog = [x for x in hepsi if x["T"] >= sinir] if dogr_acik else []
+    kripto, kripto_hata = _k_kripto(d, bas, sinir)
+
+    ozet = []                                      # (ad, istatistik) – CSV için de
+
+    def ekle(ad, tr, ay=aylar):
+        st = _k_ist(tr, ay)
+        ozet.append((ad, st))
+        return st
+
+    s_top = ekle("KRİPTO DIŞI TOPLAM", gel)
+    s_bir = ekle("BİRLEŞİK (kripto dışı + kripto)", gel + kripto) if kripto is not None else {"n": 0}
+    k_top, ok_top = _k_kural(s_top)
+    k_bir, ok_bir = _k_kural(s_bir) if kripto is not None else ([], False)
+
+    satir = [
+        f"🧪 KRİPTO DIŞI TREND BACKTEST (istek {d['istek']}) – {_ts_str(time.time())}",
+        f"🔧 Kurallar: signal_bot.py {KD_MOD} (giriş 20 mum kanal + 1d market_state, çıkış dc10, stop 2,5 ATR) | "
+        f"Doğrulama: {'AÇIK' if dogr_acik else 'KAPALI'}",
+        f"Veri: Dukascopy 4h/1d bid, UTC, {KD_BASLANGIC} – {d['bitis']} | Geliştirme {aylar[0]} – {aylar[-1]} ({len(aylar)} ay)",
+        "Maliyet: spread işlem başına bir kez (" + ", ".join(
+            f"{p_[0]} {p_[4]:.5f}".rstrip("0").rstrip(".").replace(".", ",") for p_ in KD_PIYASALAR)
+        + f"), swap gece başına yıllık %{KD_SWAP_YILLIK * 100:g}, komisyon yok | 1R = {KD_R_USDT:.0f} USDT | "
+        "her piyasada en fazla 1 pozisyon",
+        "Kripto: istek " + KD_KRIPTO_ISTEK + " trend_4h portföyü (komisyon + funding tahmini dahil R)"
+        + (f" – {len(kripto)} işlem" if kripto is not None else f" – YOK ({kripto_hata})"),
+        "",
+        "1) KARAR KURALLARI – geliştirme dönemi (tek piyasalar karar için kullanılmaz)",
+        "(a) Kripto dışı toplam:",
+        *[f"  {'✅' if ok else '❌'} {ad}: {deger}" for ad, ok, deger in k_top],
+        "  SONUÇ: " + ("✅ GEÇTİ" if ok_top else "❌ KALDI"),
+        "(b) Birleşik portföy (10 piyasa + kripto):",
+    ]
+    if kripto is None:
+        satir.append(f"  hesaplanamadı: {kripto_hata}")
+    else:
+        satir += [f"  {'✅' if ok else '❌'} {ad}: {deger}" for ad, ok, deger in k_bir]
+        satir.append("  SONUÇ: " + ("✅ GEÇTİ" if ok_bir else "❌ KALDI"))
+        alt = [dict(x, r=x.get("r_kom_dahil", x["r"])) for x in kripto]
+        s_alt = _k_ist(gel + alt, aylar)
+        satir.append(f"  bilgi: kriptoda funding tahmini hariç (sadece komisyon) birleşik ortalama {_r(s_alt['ort_r'])}, "
+                     f"PF {_f2(s_alt['pf'])}, GA alt {_r(s_alt['ga'][0]) if s_alt['ga'] else '–'}")
+
+    satir += ["", "2) TOPLAMLAR"]
+    satir += _k_satir("KRİPTO DIŞI TOPLAM", s_top)
+    if kripto is not None:
+        satir += _k_satir("KRİPTO (istek " + KD_KRIPTO_ISTEK + ")", ekle("KRİPTO", kripto))
+        satir += _k_satir("BİRLEŞİK", s_bir)
+
+    satir += ["", "3) GRUPLAR"]
+    for g in KD_GRUPLAR:
+        satir += _k_satir(g.upper(), ekle(f"grup: {g}", [x for x in gel if x["grup"] == g]))
+
+    satir += ["", "4) PİYASALAR (bilgi; karar için kullanılmaz)"]
+    for p_ in d["piyasalar"]:
+        satir += _k_satir(f"{p_} ({_k_bilgi(p_)[1]})", ekle(p_, [x for x in gel if x["sym"] == p_]))
+        satir.append(f"   açık pozisyon varken atlanan sinyal: {atl[p_]}")
+
+    satir += ["", "5) ÇEYREKLER (toplam R)"]
+    ceyrekler = list(s_top.get("ceyrekler", {}))
+    basl = ["kripto dışı"] + (["kripto", "birleşik"] if kripto is not None else [])
+    seriler = [s_top] + ([next(st for ad, st in ozet if ad == "KRİPTO"), s_bir] if kripto is not None else [])
+    satir.append("   çeyrek: " + " | ".join(basl))
+    for c in ceyrekler:
+        satir.append(f"   {c}: " + " | ".join(_r(st.get("ceyrekler", {}).get(c, 0.0)) for st in seriler))
+
+    if kripto is not None:
+        def aylik(tr):
+            a = {x: 0.0 for x in aylar}
+            for x in tr:
+                if _ts_ay(x["T"]) in a:
+                    a[_ts_ay(x["T"])] += x["r"]
+            return np.array([a[x] for x in aylar])
+        ak, ad_ = aylik(kripto), aylik(gel)
+        kor = float(np.corrcoef(ak, ad_)[0, 1]) if ak.std() > 0 and ad_.std() > 0 else None
+        sp = None
+        if kor is not None:
+            sp = float(np.corrcoef(pd.Series(ak).rank().to_numpy(), pd.Series(ad_).rank().to_numpy())[0, 1])
+        satir += ["", f"6) KORELASYON – aylık toplam R, kripto ile kripto dışı ({len(aylar)} ay)",
+                  f"   Pearson {_f2(kor)} · Spearman {_f2(sp)}",
+                  f"   ikisinin de zararda olduğu ay: {int(((ak < 0) & (ad_ < 0)).sum())} · "
+                  f"biri zararda diğeri kârda: {int(((ak < 0) != (ad_ < 0)).sum())}"]
+
+    if dogr_acik:
+        satir += ["", "7) DOĞRULAMA"]
+        sd = _k_ist(dog, d["dogrulama_aylar"])
+        satir += _k_satir("KRİPTO DIŞI TOPLAM (doğrulama)", sd)
+    else:
+        satir += ["", "Doğrulama KAPALI: geliştirme döneminden sonraki aylar hiç hesaplanmadı."]
+
+    satir += ["", "Notlar:",
+              "- Komisyon yok sayıldı (kripto dışı); spread sabit tahmin, gerçek spread haber/gece saatlerinde daha geniş olabilir.",
+              "- Swap her iki yönde maliyet (yıllık %5, UTC gece yarısı başına 1/365); gerçek swap piyasaya ve brokera göre değişir, bazen alacak olur.",
+              "- Dukascopy'nin piyasa kapalıyken ürettiği düz mumlar (hacim 0, high = low) atıldı; diğer mumlar olduğu gibi kullanıldı.",
+              "- Stopun ötesinde açılan mumda (hafta sonu boşluğu) açılış fiyatından çıkıldı. Geliştirme işlemi dönem sonunda açıksa DÖNEM ile kapatıldı.",
+              "- Kripto işlemlerinin R'si komisyon + funding tahmini dahil; kripto portföy sınırları (4 pozisyon / yönde 2) istek "
+              + KD_KRIPTO_ISTEK + "'deki gibi.",
+              f"- Süre: {(time.time() - d['baslangic']) / 60:.0f} dk."]
+    if d["hatalar"]:
+        satir += ["", "Hatalar:"] + [f"- {h}" for h in d["hatalar"][:10]]
+    metin = "\n".join(satir)
+
+    ek = f"{d['istek']}_kd"
+    rapor_yol = os.path.join(CALISMA, f"bt_rapor_{ek}.txt")
+    with open(rapor_yol, "w") as f:
+        f.write(metin)
+    ozet_yol = os.path.join(CALISMA, f"bt_ozet_{ek}.csv")
+    with open(ozet_yol, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["satir", "islem", "ort_r", "ga_alt", "ga_ust", "pf", "kazanma", "toplam_r", "toplam_usdt",
+                    "dusus_r", "karli_ceyrek", "ceyrek_say", "top5_r", "top5_kazanc_payi", "top5_net_payi",
+                    "long_n", "long_ort_r", "short_n", "short_ort_r", "spread_r", "swap_funding_r", "komisyon_r",
+                    "maliyetsiz_r", "ort_gun"])
+        for ad, st in ozet:
+            if not st["n"]:
+                w.writerow([ad, 0])
+                continue
+            ga_alt, ga_ust = st["ga"] or (None, None)
+            w.writerow([ad, st["n"], round(st["ort_r"], 4),
+                        None if ga_alt is None else round(ga_alt, 4), None if ga_ust is None else round(ga_ust, 4),
+                        round(st["pf"], 3) if math.isfinite(st["pf"]) else "inf", round(st["kazanma"], 4),
+                        round(st["toplam_r"], 3), round(st["toplam_r"] * KD_R_USDT, 2), round(st["dd_r"], 3),
+                        st["karli_ceyrek"], st["ceyrek_say"], round(st["top5"], 3),
+                        None if st["top5_kazanc"] is None else round(st["top5_kazanc"], 4),
+                        None if st["top5_net"] is None else round(st["top5_net"], 4),
+                        st["long_n"], None if st["long_ort"] is None else round(st["long_ort"], 4),
+                        st["short_n"], None if st["short_ort"] is None else round(st["short_ort"], 4),
+                        round(st["spread_r"], 4), round(st["swap_r"], 4), round(st["kom_r"], 4),
+                        round(st["brut_r"], 4), round(st["ort_gun"], 2)])
+    islem_yol = os.path.join(CALISMA, f"bt_islemler_{ek}.csv")
+    with open(islem_yol, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["piyasa", "grup", "donem", "yon", "giris_zamani_utc", "cikis_zamani_utc", "cikis", "giris_fiyati",
+                    "cikis_fiyati", "stop", "stop_pct", "r", "r_maliyetsiz", "r_spread", "r_swap", "geceler",
+                    "net_usdt", "mfe_r", "sure_gun"])
+        for x in sorted(gel + dog, key=lambda y: y["T"]):
+            utc = lambda ts: datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+            w.writerow([x["sym"], x["grup"], "dogrulama" if x["T"] >= sinir else "gelistirme",
+                        "LONG" if x["side"] == "AL" else "SHORT", utc(x["T"]), utc(x["cikis_t"]), x["cikis"],
+                        x["giris_px"], x["cikis_px"], x["stop"], x["stop_pct"], x["r"], x["r_brut"], x["r_spread"],
+                        x["r_swap"], x["geceler"], x["net"], x["mfe"], round(x["dk"] / 1440, 2)])
+
+    notify = _NOTIFY[0]
+    _gonder(notify, metin)
+    _belge_gonder(rapor_yol, f"Kripto dışı backtest raporu (istek {d['istek']})")
+    _belge_gonder(ozet_yol, "Özet tablo (toplam, kripto, birleşik, gruplar, piyasalar)")
+    _belge_gonder(islem_yol, "Kripto dışı işlem listesi")
     return True
