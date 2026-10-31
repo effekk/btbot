@@ -60,14 +60,22 @@ MAX_STOP_ATR = 4.0        # stop bundan uzaksa risk çok büyük: sinyal gönder
 #   bb_donus  : G1 – trend içinde mum Bollinger bandına değip bandın içinde, yön lehine kapanır
 #   rsi_derin : G2 – üst ZD trendi yönünde; işlem ZD'de RSI son 5 mumda 35 altına inmiş, şimdi 40'ı yukarı keser (SAT: 65 / 60)
 #   choch     : G3 – üst ZD trendi yönünde, işlem ZD'de yapı kırılır (CHoCH: son tepe/dip üstünde/altında kapanış)
+#   trend_1d  : T1 – günlük mumda EMA12/EMA26 kesişimi; çıkış ters kesişimde (TIMEFRAMES="1d" ile kullan)
+#   trend_4h  : T2 – 4s mum önceki 20 mumun tepesi/dibi ötesinde kapanır + günlük trend aynı yönde;
+#               çıkış mum önceki 10 mumun dibi/tepesi ötesinde kapandığında (TIMEFRAMES="4h" ile kullan)
+#   Trend modlarında: stop = giriş ∓ 2,5 ATR (borsada STOP_MARKET), TP / yarı kâr / süre sınırı / yapı çıkışı YOK.
 GIRIS_MODU = os.environ.get("GIRIS_MODU", "macd").strip().strip('"').strip("'").strip().lower() or "macd"
-if GIRIS_MODU not in ("macd", "bb_donus", "rsi_derin", "choch"):
+if GIRIS_MODU not in ("macd", "bb_donus", "rsi_derin", "choch", "trend_1d", "trend_4h"):
     print(f"Bilinmeyen GIRIS_MODU={GIRIS_MODU!r}, 'macd' kullanılıyor")
     GIRIS_MODU = "macd"
 RSI_DERIN_LOOKBACK = 5           # G2: RSI'nin derin bölgeye indiği son kaç mum
 RSI_DERIN_AL = (35, 40)          # G2 AL: önce < 35, sonra 40'ı yukarı kesme
 RSI_DERIN_SAT = (65, 60)         # G2 SAT: önce > 65, sonra 60'ı aşağı kesme
 SWING_K = 3                      # G3: tepe/dip = iki yanındaki 3'er mumdan yüksek/alçak (3 mum sonra kesinleşir)
+TREND_MODES = ("trend_1d", "trend_4h")
+TREND_STOP_ATR = 2.5             # T1/T2: başlangıç stop'u girişten bu kadar ATR uzakta (felaket stop'u)
+DC_GIRIS = 20                    # T2 giriş: önceki 20 mumun en yükseği / en düşüğü
+DC_CIKIS = 10                    # T2 çıkış: önceki 10 mumun en düşüğü / en yükseği
 CANDLE_LIMIT = 200
 
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
@@ -173,6 +181,16 @@ def compute_indicators(df):
     df["choch_dn"] = cd
     df["bos_up"] = bu
     df["bos_dn"] = bd
+    highs, lows = df["high"].tolist(), df["low"].tolist()
+    df["dc_hi20"] = _donchian(highs, DC_GIRIS, max)
+    df["dc_lo20"] = _donchian(lows, DC_GIRIS, min)
+    df["dc_hi10"] = _donchian(highs, DC_CIKIS, max)
+    df["dc_lo10"] = _donchian(lows, DC_CIKIS, min)
+
+
+def _donchian(values, n, fn):
+    """i. eleman: values[i-n:i] (mevcut mum hariç önceki n mum) için max/min; ilk n mumda NaN."""
+    return [fn(values[i - n:i]) if i >= n else float("nan") for i in range(len(values))]
 
 
 def market_structure(highs, lows, closes, k=3):
@@ -314,6 +332,26 @@ def _compute_signals_new(df):
                 buy_src[i].append("RSID")
             if max(prev) > RSI_DERIN_SAT[0] and r[i - 1] > RSI_DERIN_SAT[1] >= r[i]:
                 sell_src[i].append("RSID")
+    elif GIRIS_MODU == "trend_1d":
+        e12 = [_v(x) for x in df["ema_12"]]
+        e26 = [_v(x) for x in df["ema_26"]]
+        for i in range(1, n):
+            if None in (e12[i], e26[i], e12[i - 1], e26[i - 1]):
+                continue
+            if e12[i - 1] <= e26[i - 1] and e12[i] > e26[i]:
+                buy_src[i].append("EMAX")
+            elif e12[i - 1] >= e26[i - 1] and e12[i] < e26[i]:
+                sell_src[i].append("EMAX")
+    elif GIRIS_MODU == "trend_4h":
+        hi = [_v(x) for x in df["dc_hi20"]]
+        lo = [_v(x) for x in df["dc_lo20"]]
+        for i in range(1, n):
+            if None in (hi[i], lo[i], hi[i - 1], lo[i - 1]):
+                continue
+            if close_[i] > hi[i] and close_[i - 1] <= hi[i - 1]:     # kanalın üstünde İLK kapanış
+                buy_src[i].append("DC20")
+            elif close_[i] < lo[i] and close_[i - 1] >= lo[i - 1]:
+                sell_src[i].append("DC20")
     elif GIRIS_MODU == "choch":
         cu = df["choch_up"].tolist()
         cd = df["choch_dn"].tolist()
@@ -338,6 +376,35 @@ def _pullback_trend_ok(df, idx, side):
     if side == "AL":
         return e12 > e26 and slope > 0
     return e12 < e26 and slope < 0
+
+
+def trend_exit(df, idx, side, rule):
+    """
+    Trend modlarında iz süren çıkış: idx. (kapanmış) mumda çıkış koşulu oluştu mu?
+      rule "ema" : LONG → EMA12 < EMA26, SHORT → EMA12 > EMA26 (ters kesişim)
+      rule "dc10": LONG → kapanış < önceki 10 mumun en düşüğü, SHORT → kapanış > önceki 10 mumun en yükseği
+    Dönüş: açıklama metni ya da None. Sadece df["col"][i] erişimi kullanır.
+    """
+    close = float(df["close"][idx])
+    if rule == "ema":
+        e12, e26 = _v(df["ema_12"][idx]), _v(df["ema_26"][idx])
+        if e12 is None or e26 is None:
+            return None
+        if side == "AL" and e12 < e26:
+            return f"EMA12 EMA26'nın altına indi ({e12:.6g} < {e26:.6g})"
+        if side == "SAT" and e12 > e26:
+            return f"EMA12 EMA26'nın üstüne çıktı ({e12:.6g} > {e26:.6g})"
+        return None
+    if rule == "dc10":
+        if side == "AL":
+            lvl = _v(df["dc_lo10"][idx])
+            if lvl is not None and close < lvl:
+                return f"mum önceki {DC_CIKIS} mumun dibinin altında kapandı ({close:g} < {lvl:g})"
+        else:
+            lvl = _v(df["dc_hi10"][idx])
+            if lvl is not None and close > lvl:
+                return f"mum önceki {DC_CIKIS} mumun tepesinin üstünde kapandı ({close:g} > {lvl:g})"
+    return None
 
 
 def market_state(df, idx):
@@ -401,6 +468,8 @@ def check_alert(df, buy_src, sell_src, htf_trend, min_indicators=MIN_INDICATORS)
 
     trend, squeeze = market_state(df, i)
     wanted = "YÜKSELİŞ" if side == "AL" else "DÜŞÜŞ"
+    if GIRIS_MODU in TREND_MODES:
+        return _trend_alert(df, i, side, src, trend, squeeze, htf_trend, wanted)
     if GIRIS_MODU == "macd":
         if trend != wanted:                          # eski: işlem ZD trendi aynı yönde olmalı
             return None
@@ -445,6 +514,28 @@ def check_alert(df, buy_src, sell_src, htf_trend, min_indicators=MIN_INDICATORS)
     }
 
 
+def _trend_alert(df, i, side, src, trend, squeeze, htf_trend, wanted):
+    """T1/T2: stop = giriş ∓ 2,5 ATR, TP yok (target sadece uyumluluk için). T2 günlük trend ister."""
+    if GIRIS_MODU == "trend_4h" and htf_trend != wanted:
+        return None
+    entry = float(df["close"][i])
+    a = _v(df["atr"][i])
+    if a is None or a <= 0:
+        return None
+    risk = TREND_STOP_ATR * a
+    stop = entry - risk if side == "AL" else entry + risk
+    target = entry + TP_R * risk if side == "AL" else entry - TP_R * risk
+    if stop <= 0 or target <= 0:
+        return None
+    return {
+        "side": side, "sources": src, "trend": trend, "htf_trend": htf_trend,
+        "squeeze": squeeze, "time": df["datetime"][i], "entry": entry,
+        "stop": stop, "target": target, "risk_pct": risk / entry * 100,
+        "atr_pct": a / entry * 100, "risk_atr": risk / a,
+        "exit_mode": "trend", "exit_rule": "ema" if GIRIS_MODU == "trend_1d" else "dc10",
+    }
+
+
 def fmt_price(p):
     if p >= 1000:
         return f"{p:,.2f}"
@@ -463,7 +554,11 @@ def alert_text(symbol, timeframe, a):
         f"Sinyal: {'+'.join(a['sources'])}",
         f"Trend {timeframe}: {a['trend']}" + (f" | {htf}: {a['htf_trend'] or '-'}" if htf else ""),
         f"🛑 SL: {fmt_price(a['stop'])} → zarar: -%{a['risk_pct']:.2f}",
-        f"🎯 TP (1:{TP_R:g}): {fmt_price(a['target'])} → kâr: +%{TP_R * a['risk_pct']:.2f}",
+        (f"🎯 TP yok – iz süren çıkış: "
+         + ("ters EMA12/26 kesişimi" if a.get("exit_rule") == "ema"
+            else f"mum önceki {DC_CIKIS} mumun {'dibinin altında' if a['side'] == 'AL' else 'tepesinin üstünde'} kapanınca")
+         if a.get("exit_mode") == "trend" else
+         f"🎯 TP (1:{TP_R:g}): {fmt_price(a['target'])} → kâr: +%{TP_R * a['risk_pct']:.2f}"),
         f"Stop mesafesi: {a['risk_atr']:.1f} ATR (1 ATR = %{a['atr_pct']:.2f})",
         "(yüzdeler sinyal fiyatından girildiğinde, kaldıraçsız)",
     ]
@@ -585,7 +680,7 @@ def scan_timeframe(timeframe, state, errors, report):
             buy_src, sell_src = compute_signals(df)
 
             htf_trend = None
-            if htf:
+            if htf and GIRIS_MODU != "trend_1d":        # T1 üst zaman dilimine bakmaz (7d çekilmez)
                 hdf = fetch_candles(symbol, htf)
                 if len(hdf) >= 40:
                     htf_trend, _ = market_state(hdf, len(hdf) - 2)
