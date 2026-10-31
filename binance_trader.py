@@ -36,7 +36,7 @@ API_KEY = os.environ.get("BINANCE_API_KEY", "").strip()
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "").strip()
 
 MARGIN_USDT = 1000.0          # her işlemde kullanılacak teminat
-LOSS_PCT_OF_MARGIN = 0.30     # SL'de teminatın %30'u kaybedilir (1000 $ → 300 $)
+LOSS_PCT_OF_MARGIN = 0.10     # SL'de teminatın %10'u kaybedilir (1000 $ → 100 $ = 1R). trend_4h demo testi için 0.30 → 0.10
 MAX_OPEN_POSITIONS = 4        # aynı anda en fazla kaç pozisyon
 MAX_SAME_DIRECTION = 2        # aynı yönde (LONG ya da SHORT) en fazla kaç pozisyon – coinler BTC ile birlikte hareket eder
 MAX_LEVERAGE = 50             # coinin izni daha yüksek olsa bile bu sınırı aşma
