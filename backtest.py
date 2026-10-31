@@ -18,6 +18,12 @@ Varsayımlar:
   - Botun dakikalık yönetim işleri (SL'yi girişe çekme, yapı ve süre çıkışı) bir sonraki
     dakikanın açılışında yapılır. Komisyon taker %0,05 (her dolumda). Funding ve kayma yok.
 
+ayarlar.env:
+  BACKTEST_ISTEGI   – değişince yeni backtest başlar
+  DOGRULAMA_GOSTER  – false/tanımsız: son 4 ay hiç hesaplanmaz, sadece ayar dönemi; true: doğrulama da yapılır
+  GIRIS_MODU        – signal_bot.py'deki giriş fikri; raporun başına yazılır
+  GIRIS_MODU ya da DOGRULAMA_GOSTER değişince de yeni backtest başlar.
+
 Çalışma klasörü: /opt/sinyalbot/bt_calisma (repo dışında; veri ~0,5 GB).
 """
 import concurrent.futures
@@ -242,6 +248,22 @@ def _belge_gonder(yol, aciklama=""):
 _NOTIFY = [print]          # rapor aşaması Telegram için bunu kullanır
 
 
+def _giris_modu():
+    """signal_bot.py'deki GIRIS_MODU (yoksa ayarlar.env'deki değer)."""
+    m = getattr(sb, "GIRIS_MODU", None) or os.environ.get("GIRIS_MODU", "")
+    m = str(m).strip().strip('"').strip("'").strip()
+    return m or "tanımsız"
+
+
+def _dogrulama_ayari():
+    """DOGRULAMA_GOSTER=true ise son 4 ay hesaplanır ve gösterilir. Tanımsızsa KAPALI (yanlışlıkla bakılmasın)."""
+    return sb._flag("DOGRULAMA_GOSTER")
+
+
+def _dosya_adi(x):
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in x)
+
+
 def adim(notify):
     _NOTIFY[0] = notify
     istek = os.environ.get(ISTEK_DEGISKENI, "").strip().strip('"').strip("'")
@@ -249,7 +271,9 @@ def adim(notify):
         return
     os.makedirs(CALISMA, exist_ok=True)
     d = _json_oku(DURUM, {}) or {}
-    if d.get("istek") != istek:
+    mod, dogr = _giris_modu(), _dogrulama_ayari()
+    if (d.get("istek") != istek or d.get("giris_modu", mod) != mod
+            or d.get("dogrulama", dogr) != dogr):
         d = _yeni_is(istek, notify)
         _json_yaz(DURUM, d)
     if d.get("asama") == "bitti":
@@ -285,12 +309,14 @@ def _yeni_is(istek, notify):
         "indir_aylar": _ay_listesi(son, TEST_AY + ISINMA_AY), "test_aylar": test,
         "ayar_aylar": test[:AYAR_AY], "dogrulama_aylar": test[AYAR_AY:],
         "hatalar": [], "deneme": {}, "eksik": {}, "atlanan_coin": [],
+        "giris_modu": _giris_modu(), "dogrulama": _dogrulama_ayari(),
     }
     notify("\n".join([
-        f"🧪 Backtest başladı (istek {istek})",
+        f"🧪 Backtest başladı (istek {istek}) – GIRIS_MODU: {d['giris_modu']}",
         f"Veri: Binance USDⓈ-M Futures, {len(d['semboller'])} coin, sinyal {'+'.join(sb.TIMEFRAMES)}, çıkışlar 1m",
         f"Ayar/karşılaştırma: {test[0]} – {test[AYAR_AY - 1]} ({AYAR_AY} ay)",
-        f"Doğrulama (tek sefer): {test[AYAR_AY]} – {test[-1]} ({TEST_AY - AYAR_AY} ay)",
+        (f"Doğrulama (tek sefer): {test[AYAR_AY]} – {test[-1]} ({TEST_AY - AYAR_AY} ay)" if d["dogrulama"] else
+         f"Doğrulama: KAPALI (DOGRULAMA_GOSTER=false) – {test[AYAR_AY]} – {test[-1]} hiç hesaplanmayacak"),
         "Varyantlar: " + " · ".join(f"{v['kod']} {v['ad']}" for v in VARYANTLAR),
         f"Seçim: {SECIM_KURALI}",
         "Canlı bot her dakikadan sonra kalan sürede ilerler; birkaç saat sürebilir. Aşama bitince haber veririm.",
@@ -495,6 +521,8 @@ def _b_sinyal(d, b):
     bas = _ay_bas_ts(d["test_aylar"][0])
     son = _ay_son_ts(d["test_aylar"][-1])
     sinir = _ay_bas_ts(d["dogrulama_aylar"][0])
+    if not d.get("dogrulama", True):
+        son = sinir                                         # doğrulama dönemi hiç hesaplanmaz
     gecici = os.path.join(SINYAL, f"{bsym}_{tf}.yarim.json")
     kayit = (_json_oku(gecici, {}) or {}) if d["alt"] else {}
     liste = kayit.get("sinyaller", [])
@@ -874,8 +902,8 @@ def _mfe(tr, tp_r):
         oran = float(((m >= a) & (m < b)).mean())
         etiket = f"{_f2(a)}–{_f2(b)}R" if math.isfinite(b) else f"≥{_f2(a)}R"
         satir.append(f"   {etiket}: {_pct(oran)} {'█' * int(round(oran * 40))}")
-    satir.append("  Ulaşma: " + " · ".join(f"≥{_f2(e)}R {_pct(float((m >= e).mean()))}"
-                                          for e in (0.5, tp_r * bt.PARTIAL_AT, 1.0, 1.5, 2.0)))
+    esikler = sorted({0.5, 0.75, 1.0, 1.5, 2.0, round(tp_r * bt.PARTIAL_AT, 4)})   # yarı kâr seviyesi de dahil
+    satir.append("  Ulaşma: " + " · ".join(f"≥{_f2(e)}R {_pct(float((m >= e).mean()))}" for e in esikler))
     sl = np.array([x["mfe"] for x in tr if x["cikis"] == "SL"])
     if len(sl):
         satir.append(f"  SL ile kapananlar ({len(sl)}): önce ≥0,5R'ye ulaşan {_pct(float((sl >= 0.5).mean()))}, "
@@ -1061,6 +1089,10 @@ def _b_rapor(d, b):
     sym_sira = {bs: i for i, (_, bs) in enumerate(d["semboller"])}
     tf_sira = {tf: i for i, tf in enumerate(sb.TIMEFRAMES)}
     sinir = _ay_bas_ts(d["dogrulama_aylar"][0])
+    dogr_acik = d.get("dogrulama", True)
+    mod = d.get("giris_modu") or "tanımsız"
+    if not dogr_acik:
+        hepsi = [x for x in hepsi if x["T"] < sinir]       # güvenlik: doğrulama dönemi hiçbir yere girmez
     sinyal_say = len({(x["sym"], x["tf"], x["T"]) for x in hepsi})
     atla_say = {}
     for x in hepsi:
@@ -1079,17 +1111,23 @@ def _b_rapor(d, b):
     alinan_s = port[sk][0]
     ayar_tr = [x for x in alinan_s if x["T"] < sinir]
     dogr_tr = [x for x in alinan_s if x["T"] >= sinir]
-    dg = _ist(dogr_tr, d["dogrulama_aylar"])
+    dg = _ist(dogr_tr, d["dogrulama_aylar"]) if dogr_acik else {"n": 0}
 
-    # Doğrulama "bir kez": ilk sonuç kaydedilir, sonraki çalıştırmalarda uyarı verilir
+    # Doğrulama "bir kez" (giriş moduna göre): ilk bakış kaydedilir, sonrakilerde uyarı verilir
     kayit = _json_oku(DOGRULAMA_KAYDI, {}) or {}
-    onceki = kayit.get("ilk")
+    modlar = dict(kayit.get("modlar", {}))
+    if kayit.get("ilk") and "eski strateji (GIRIS_MODU öncesi)" not in modlar:
+        modlar["eski strateji (GIRIS_MODU öncesi)"] = kayit["ilk"]
+    onceki = modlar.get(mod)
+    baska = [f"{k} ({v.get('tarih', '?')})" for k, v in modlar.items() if k != mod]
 
     satir = [
         f"🧪 BACKTEST SONUCU (istek {d['istek']}) – {_ts_str(time.time())}",
+        f"🔧 GIRIS_MODU: {mod} | Doğrulama: {'AÇIK' if dogr_acik else 'KAPALI (sadece ayar dönemi)'}",
         f"Veri: Binance USDⓈ-M Futures | {len(d['semboller']) - len(d['atlanan_coin'])} coin | "
         f"sinyal {'+'.join(sb.TIMEFRAMES)} (üst: {', '.join(sb.HIGHER_TF[t] for t in sb.TIMEFRAMES)}) | çıkış 1m",
-        f"Ayar dönemi: {d['ayar_aylar'][0]} – {d['ayar_aylar'][-1]} | Doğrulama: {d['dogrulama_aylar'][0]} – {d['dogrulama_aylar'][-1]}",
+        f"Ayar dönemi: {d['ayar_aylar'][0]} – {d['ayar_aylar'][-1]} | Doğrulama: "
+        + (f"{d['dogrulama_aylar'][0]} – {d['dogrulama_aylar'][-1]}" if dogr_acik else "hesaplanmadı"),
         f"Toplam sinyal: {sinyal_say}" + (" | işleme dönmeyen: " + " · ".join(f"{k} {v}" for k, v in atla_say.items())
                                           if atla_say else ""),
         f"Pozisyon: {bt.MARGIN_USDT:.0f} USDT teminat, SL'de ≈{bt.MARGIN_USDT * bt.LOSS_PCT_OF_MARGIN:.0f} USDT (1R), "
@@ -1101,40 +1139,52 @@ def _b_rapor(d, b):
         atl = port[v["kod"]][1]
         satir.append(_ozet(f"{v['kod']} {v['ad']}", ayar[v["kod"]]))
         satir.append("   sınır nedeniyle atlanan: " + " · ".join(f"{k} {n}" for k, n in atl.items()))
-    satir += [f"➡️ Seçilen: {sk} {secilen['ad']} ({SECIM_KURALI})", "",
-              f"2) DOĞRULAMA – sadece {sk}, tek sefer"]
-    if onceki:
-        satir.append(f"⚠️ Doğrulama dönemi ilk kez {onceki['tarih']} tarihinde (istek {onceki['istek']}, varyant "
-                     f"{onceki['varyant']}) görüldü. Karar o ilk sonuca göre verilir; bu tekrar bakıştır.")
-    satir.append(_ozet(f"{sk} {secilen['ad']}", dg))
+    satir += [f"➡️ Seçilen: {sk} {secilen['ad']} ({SECIM_KURALI})", ""]
+    gecti = False
+    if not dogr_acik:
+        satir += ["2) DOĞRULAMA – KAPALI (DOGRULAMA_GOSTER=false): son 4 ay hesaplanmadı, karar kuralları uygulanmadı.",
+                  "   Giriş fikirlerini ilk 8 aya göre karşılaştır; seçilen tek fikir için en sonda bir kez aç."]
+    else:
+        satir.append(f"2) DOĞRULAMA – GIRIS_MODU {mod}, varyant {sk}, tek sefer")
+        if onceki:
+            satir.append(f"⚠️ Bu giriş modu için doğrulama ilk kez {onceki.get('tarih')} tarihinde (istek {onceki.get('istek')}, "
+                         f"varyant {onceki.get('varyant')}) görüldü. Karar o ilk sonuca göre verilir; bu tekrar bakıştır.")
+        if baska:
+            satir.append("⚠️ Doğrulama dönemi daha önce başka giriş modlarıyla da görüldü: " + ", ".join(baska)
+                         + ". Her ek bakış bu dönemin 'görülmemiş veri' niteliğini azaltır.")
+        satir.append(_ozet(f"{sk} {secilen['ad']}", dg))
 
-    kural = []
-    if dg["n"]:
-        kural = [
-            ("Ortalama ≥ +0,10R", dg["ort_r"] >= KARAR_ORT_R, _r(dg["ort_r"])),
-            ("%95 GA alt sınırı > 0", dg["ga"][0] > 0, _r(dg["ga"][0])),
-            (f"Kâr faktörü ≥ {_f2(KARAR_PF)}", dg["pf"] >= KARAR_PF, _f2(dg["pf"])),
-            (f"Kârlı ay ≥ %{KARAR_KARLI_AY * 100:.0f}", dg["karli_ay"] >= math.ceil(KARAR_KARLI_AY * dg["ay_say"] - 1e-9),
-             f"{dg['karli_ay']}/{dg['ay_say']}"),
-            (f"En büyük düşüş ≤ {KARAR_MAX_DD_USDT:,.0f} USDT".replace(",", "."), dg["dd"] <= KARAR_MAX_DD_USDT, _usd(-dg["dd"])),
-        ]
-    gecti = bool(kural) and all(k[1] for k in kural)
-    satir.append("Karar kuralları:")
-    satir += [f"  {'✅' if ok else '❌'} {ad}: {deger}" for ad, ok, deger in kural] or ["  doğrulamada işlem yok"]
-    satir.append("SONUÇ: " + ("✅ GEÇTİ – canlı demo sadece doğrulama için sürdürülür (eşikler aşağıda)." if gecti else
-                             "❌ KALDI – anlaştığımız gibi çıkışlarla oynamayı bırakıp girişleri sorguluyoruz."))
+        kural = []
+        if dg["n"]:
+            kural = [
+                ("Ortalama ≥ +0,10R", dg["ort_r"] >= KARAR_ORT_R, _r(dg["ort_r"])),
+                ("%95 GA alt sınırı > 0", dg["ga"][0] > 0, _r(dg["ga"][0])),
+                (f"Kâr faktörü ≥ {_f2(KARAR_PF)}", dg["pf"] >= KARAR_PF, _f2(dg["pf"])),
+                (f"Kârlı ay ≥ %{KARAR_KARLI_AY * 100:.0f}",
+                 dg["karli_ay"] >= math.ceil(KARAR_KARLI_AY * dg["ay_say"] - 1e-9), f"{dg['karli_ay']}/{dg['ay_say']}"),
+                (f"En büyük düşüş ≤ {KARAR_MAX_DD_USDT:,.0f} USDT".replace(",", "."), dg["dd"] <= KARAR_MAX_DD_USDT,
+                 _usd(-dg["dd"])),
+            ]
+        gecti = bool(kural) and all(k[1] for k in kural)
+        satir.append("Karar kuralları:")
+        satir += [f"  {'✅' if ok else '❌'} {ad}: {deger}" for ad, ok, deger in kural] or ["  doğrulamada işlem yok"]
+        satir.append("SONUÇ: " + ("✅ GEÇTİ – canlı demo sadece doğrulama için sürdürülür (eşikler aşağıda)." if gecti else
+                                 "❌ KALDI – anlaştığımız gibi çıkışlarla oynamayı bırakıp girişleri sorguluyoruz."))
 
     satir += ["", f"3) DÖKÜM – {sk}, ayar dönemi"] + _dokum(ayar_tr, ayar[sk])
-    satir += ["", f"   {sk}, doğrulama dönemi"] + _dokum(dogr_tr, dg)
+    if dogr_acik:
+        satir += ["", f"   {sk}, doğrulama dönemi"] + _dokum(dogr_tr, dg)
     satir += ["", f"4) MFE – {sk}, ayar dönemi"] + _mfe(ayar_tr, secilen["tp_r"])
-    satir += [f"   {sk}, doğrulama dönemi"] + _mfe(dogr_tr, secilen["tp_r"])
+    if dogr_acik:
+        satir += [f"   {sk}, doğrulama dönemi"] + _mfe(dogr_tr, secilen["tp_r"])
     if sk != "A":
         a_ayar = [x for x in port["A"][0] if x["T"] < sinir]
         satir += ["   A (mevcut kurallar), ayar dönemi"] + _mfe(a_ayar, VARYANTLAR[0]["tp_r"])
 
-    ay_basina = max(1, round(len(alinan_s) / max(1, len(d["test_aylar"]))))
+    mc_aylar = d["test_aylar"] if dogr_acik else d["ayar_aylar"]
+    ay_basina = max(1, round(len(alinan_s) / max(1, len(mc_aylar))))
     mc = _monte_carlo(alinan_s, [50, 100, ay_basina])
-    satir += ["", f"5) CANLI İZLEME EŞİKLERİ – {sk}, 12 ayın tüm işlemlerinden Monte Carlo (2000 karıştırma)"]
+    satir += ["", f"5) CANLI İZLEME EŞİKLERİ – {sk}, {len(mc_aylar)} ayın tüm işlemlerinden Monte Carlo (2000 karıştırma)"]
     for u, dd95, seri95 in mc:
         etiket = f"{u} işlem" + (" (≈1 ay)" if u == ay_basina else "")
         satir.append(f"  {etiket}: %95 düşüş {_usd(-dd95)} USDT ({_f2(dd95 / (bt.MARGIN_USDT * bt.LOSS_PCT_OF_MARGIN))}R)"
@@ -1155,14 +1205,16 @@ def _b_rapor(d, b):
         satir += ["Eksik veri ayları: " + "; ".join(f"{k}: {','.join(v)}" for k, v in list(d["eksik"].items())[:10])]
     metin = "\n".join(satir)
 
-    if not onceki:
-        _json_yaz(DOGRULAMA_KAYDI, {"ilk": {"tarih": _ts_str(time.time()), "istek": d["istek"], "varyant": sk,
-                                            "gecti": gecti, "ort_r": dg.get("ort_r"), "n": dg["n"]}})
+    if dogr_acik and not onceki:
+        kayit.setdefault("modlar", {})[mod] = {"tarih": _ts_str(time.time()), "istek": d["istek"], "varyant": sk,
+                                               "gecti": gecti, "ort_r": dg.get("ort_r"), "n": dg["n"]}
+        _json_yaz(DOGRULAMA_KAYDI, kayit)
 
-    rapor_yol = os.path.join(CALISMA, f"bt_rapor_{d['istek']}.txt")
+    ek = f"{d['istek']}_{_dosya_adi(mod)}"
+    rapor_yol = os.path.join(CALISMA, f"bt_rapor_{ek}.txt")
     with open(rapor_yol, "w") as f:
         f.write(metin)
-    csv_yol = os.path.join(CALISMA, f"bt_islemler_{d['istek']}.csv")
+    csv_yol = os.path.join(CALISMA, f"bt_islemler_{ek}.csv")
     with open(csv_yol, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["varyant", "donem", "sembol", "tf", "yon", "giris_zamani", "cikis_zamani", "cikis", "yari_kar",
@@ -1180,7 +1232,7 @@ def _b_rapor(d, b):
                            + [x.get("mfe16"), x.get("mae16"), x.get("ilk1r")])
 
     # Ayar dönemindeki TÜM sinyaller (pozisyon sınırı olmadan), her varyantın bağımsız sonucuyla
-    sinyal_yol = os.path.join(CALISMA, f"bt_sinyaller_ayar_{d['istek']}.csv")
+    sinyal_yol = os.path.join(CALISMA, f"bt_sinyaller_ayar_{ek}.csv")
     alinmis = {v["kod"]: {(x["sym"], x["tf"], x["T"]) for x in port[v["kod"]][0]} for v in VARYANTLAR}
     satirlar = {}
     for x in hepsi:
@@ -1210,7 +1262,8 @@ def _b_rapor(d, b):
 
     notify = _NOTIFY[0]
     _gonder(notify, metin)
-    _belge_gonder(rapor_yol, f"Backtest raporu (istek {d['istek']})")
-    _belge_gonder(csv_yol, "Portföyde alınan işlemler (ayar: tüm varyantlar, doğrulama: sadece seçilen)")
+    _belge_gonder(rapor_yol, f"Backtest raporu (istek {d['istek']}, GIRIS_MODU {mod})")
+    _belge_gonder(csv_yol, "Portföyde alınan işlemler" + (" (ayar: tüm varyantlar, doğrulama: sadece seçilen)"
+                                                         if dogr_acik else " (sadece ayar dönemi)"))
     _belge_gonder(sinyal_yol, "Ayar dönemindeki tüm sinyaller, pozisyon sınırı olmadan (bağlam + MFE/MAE + her varyantın sonucu)")
     return True
