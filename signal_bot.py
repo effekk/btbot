@@ -1,15 +1,18 @@
 """
-Gate.io sinyal botu – GitHub Actions üzerinde çalışır, bilgisayar gerekmez.
+Kripto sinyal botu (Hetzner sunucusunda dakikada bir çalışır).
 
-Her çalıştırmada izleme listesindeki coinleri tarar. Son KAPANMIŞ mumda
-trend yönünde ve üst zaman dilimiyle uyumlu bir sinyal bulursa Telegram'a gönderir.
-Aynı sinyal ikinci kez gönderilmez (state.json).
+Dosya düzeni:
+  signal_bot.py         – veri (Gate.io), ortak indikatörler, tarama, Telegram   ← stratejiye özel kod YOK
+  strateji_<kod>.py     – bir stratejinin tamamı: coinler, zaman dilimi, giriş, stop, çıkış
+  binance_trader.py     – Binance Futures'ta işlem açma ve yönetme
+  rapor.py              – işlem kaydı, günlük / haftalık rapor, durma uyarıları
 
-Ayarlar ortam değişkenlerinden okunur (.github/workflows/signal.yml içinde):
-  SYMBOLS, TIMEFRAMES, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TEST_RUN,
-  TRADING_ENABLED, BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_BASE_URL
+Hangi stratejilerin çalışacağı ayarlar.env → STRATEJILER (virgülle birden fazla).
+Ayarlar ortam değişkenlerinden: SYMBOLS, STRATEJILER, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+TEST_RUN, TRADING_ENABLED, RAPOR_ISTEGI, BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_BASE_URL
 """
 import datetime
+import importlib
 import json
 import os
 import sys
@@ -27,207 +30,73 @@ import pandas as pd
 DEFAULT_SYMBOLS = ("BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, BNB_USDT, DOGE_USDT, ADA_USDT, "
                    "AVAX_USDT, LINK_USDT, DOT_USDT, LTC_USDT, TRX_USDT, SUI_USDT, NEAR_USDT, "
                    "APT_USDT, ARB_USDT, OP_USDT, ATOM_USDT, PEPE_USDT, SHIB_USDT")
-SYMBOLS = [s.strip().upper() for s in os.environ.get("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
-# Virgülle birden fazla zaman dilimi: her biri kendi mumu kapandığında taranır
-TIMEFRAMES = [t.strip() for t in os.environ.get("TIMEFRAMES", "15m, 1h").split(",") if t.strip()]
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+
+def _env(name, default=""):
+    return os.environ.get(name, default).strip().strip('"').strip("'").strip()
+
+
 def _flag(name):
     """true/True/"true"/yes/1 -> True; boşluk, tırnak ve görünmeyen karakterler yok sayılır."""
-    return os.environ.get(name, "").strip().strip('"').strip("'").strip().lower() in ("true", "1", "yes", "evet")
+    return _env(name).lower() in ("true", "1", "yes", "evet")
 
 
+SYMBOLS = [s.strip().upper() for s in _env("SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()]
+STRATEJILER = [s.strip().lower() for s in (_env("STRATEJILER") or "trend_4h").split(",") if s.strip()]
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TEST_RUN = _flag("TEST_RUN")
-# "true" ise sinyalde Binance Futures'ta otomatik işlem açılır (binance_trader.py)
-TRADING_ENABLED = _flag("TRADING_ENABLED")
-REPORT_NOW = _flag("REPORT_NOW")       # sinyalbot-rapor: raporu hemen gönder
-TZ = ZoneInfo("Europe/Istanbul")      # mesajlardaki saatler Türkiye saati
+TRADING_ENABLED = _flag("TRADING_ENABLED")   # true → sinyalde Binance Futures'ta işlem açılır
+REPORT_NOW = _flag("REPORT_NOW")             # sinyalbot-rapor: raporu hemen gönder
+TZ = ZoneInfo("Europe/Istanbul")             # mesajlardaki saatler Türkiye saati
 STATE_FILE = "state.json"
-
-RECENT_WINDOW = 3
-TREND_SOURCES = {"EMA", "MACD"}
-REVERSION_SOURCES = {"RSI", "BB"}
-MIN_INDICATORS = 1        # alarm için aynı mumda en az kaç indikatör tetiklenmeli
-STOP_LOOKBACK = 10        # stop seviyesi: son kaç kapanmış mumun dibi / tepesi
-ATR_PERIOD = 14           # ATR: bir mumun ortalama hareket genişliği (normal dalgalanma)
-STOP_BUFFER_ATR = 0.5     # stop, dibin/tepenin bu kadar ATR ötesine konur (fitile karşı pay)
-MIN_STOP_ATR = 1.0        # stop girişe en az bu kadar ATR uzak olmalı (daha yakınsa genişletilir)
-TP_R = 1.5                # TP, stop mesafesinin kaç katı uzakta (1.5 = 1:1,5). Önceden 2.0
-MAX_STOP_ATR = 4.0        # stop bundan uzaksa risk çok büyük: sinyal gönderilmez
-
-# Giriş modu (ayarlar.env → GIRIS_MODU):
-#   macd      : eski davranış (RSI/MACD/EMA/BB, işlem ZD trendi + üst ZD trendi)
-#   bb_donus  : G1 – trend içinde mum Bollinger bandına değip bandın içinde, yön lehine kapanır
-#   rsi_derin : G2 – üst ZD trendi yönünde; işlem ZD'de RSI son 5 mumda 35 altına inmiş, şimdi 40'ı yukarı keser (SAT: 65 / 60)
-#   choch     : G3 – üst ZD trendi yönünde, işlem ZD'de yapı kırılır (CHoCH: son tepe/dip üstünde/altında kapanış)
-#   trend_1d  : T1 – günlük mumda EMA12/EMA26 kesişimi; çıkış ters kesişimde (TIMEFRAMES="1d" ile kullan)
-#   trend_4h  : T2 – 4s mum önceki 20 mumun tepesi/dibi ötesinde kapanır + günlük trend aynı yönde;
-#               çıkış mum önceki 10 mumun dibi/tepesi ötesinde kapandığında (TIMEFRAMES="4h" ile kullan)
-#   Trend modlarında: stop = giriş ∓ 2,5 ATR (borsada STOP_MARKET), TP / yarı kâr / süre sınırı / yapı çıkışı YOK.
-GIRIS_MODU = os.environ.get("GIRIS_MODU", "macd").strip().strip('"').strip("'").strip().lower() or "macd"
-if GIRIS_MODU not in ("macd", "bb_donus", "rsi_derin", "choch", "trend_1d", "trend_4h"):
-    print(f"Bilinmeyen GIRIS_MODU={GIRIS_MODU!r}, 'macd' kullanılıyor")
-    GIRIS_MODU = "macd"
-RSI_DERIN_LOOKBACK = 5           # G2: RSI'nin derin bölgeye indiği son kaç mum
-RSI_DERIN_AL = (35, 40)          # G2 AL: önce < 35, sonra 40'ı yukarı kesme
-RSI_DERIN_SAT = (65, 60)         # G2 SAT: önce > 65, sonra 60'ı aşağı kesme
-SWING_K = 3                      # G3: tepe/dip = iki yanındaki 3'er mumdan yüksek/alçak (3 mum sonra kesinleşir)
-TREND_MODES = ("trend_1d", "trend_4h")
-TREND_STOP_ATR = 2.5             # T1/T2: başlangıç stop'u girişten bu kadar ATR uzakta (felaket stop'u)
-DC_GIRIS = 20                    # T2 giriş: önceki 20 mumun en yükseği / en düşüğü
-DC_CIKIS = 10                    # T2 çıkış: önceki 10 mumun en düşüğü / en yükseği
 CANDLE_LIMIT = 200
+ATR_PERIOD = 14
 
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
-                    "4h": 14400, "8h": 28800, "1d": 86400, "7d": 604800}
-HIGHER_TF = {"1m": "15m", "5m": "1h", "15m": "1h", "30m": "4h", "1h": "4h",
-             "4h": "1d", "8h": "1d", "1d": "7d"}
+                    "4h": 14400, "8h": 28800, "1d": 86400}
 
 
 # =========================================================================
-# İndikatörler, sinyaller ve alarm kuralı (masaüstü sürümüyle birebir aynı)
+# Ortak indikatörler (her stratejinin kullanabileceği sütunlar)
 # =========================================================================
 def ema(series, period):
     if len(series) == 0:
         return []
-    ema_values = []
-    multiplier = 2 / (period + 1)
-    ema_values.append(series[0])
-    for i in range(1, len(series)):
-        prev_ema = ema_values[-1]
-        value = (series[i] - prev_ema) * multiplier + prev_ema
-        ema_values.append(value)
-    return ema_values
+    out = [series[0]]
+    k = 2 / (period + 1)
+    for x in series[1:]:
+        out.append((x - out[-1]) * k + out[-1])
+    return out
 
 
 def rsi(series, period=14):
-    if len(series) < 2:
-        return [None] * len(series)
+    """Wilder RSI. İlk `period` mum için None."""
+    out = [None] * len(series)
     deltas = [series[i] - series[i - 1] for i in range(1, len(series))]
-    rsi_list = [None] * len(series)
     if len(deltas) < period:
-        return rsi_list
-    gains = [d for d in deltas[:period] if d > 0]
-    losses = [abs(d) for d in deltas[:period] if d < 0]
-    avg_gain = sum(gains) / period if gains else 0
-    avg_loss = sum(losses) / period if losses else 0
-
+        return out
+    avg_gain = sum(d for d in deltas[:period] if d > 0) / period
+    avg_loss = sum(-d for d in deltas[:period] if d < 0) / period
     for i in range(period, len(deltas)):
-        delta = deltas[i]
-        gain = delta if delta > 0 else 0
-        loss = abs(delta) if delta < 0 else 0
-
-        avg_gain = ((avg_gain * (period - 1)) + gain) / period
-        avg_loss = ((avg_loss * (period - 1)) + loss) / period
-
-        if avg_loss == 0:
-            rsi_value = 100
-        else:
-            rs = avg_gain / avg_loss
-            rsi_value = 100 - (100 / (1 + rs))
-
-        rsi_list[i + 1] = rsi_value
-
-    return rsi_list
-
-
-def macd(series, fast=12, slow=26, signal=9):
-    if len(series) == 0:
-        return [], [], []
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
-    signal_line = ema(macd_line, signal)
-    histogram = [m - sig for m, sig in zip(macd_line, signal_line)]
-    return macd_line, signal_line, histogram
+        d = deltas[i]
+        avg_gain = (avg_gain * (period - 1) + max(d, 0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-d, 0)) / period
+        out[i + 1] = 100 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
+    return out
 
 
 def bollinger_bands(series, period=20, std_factor=2):
-    if len(series) == 0:
-        return [], [], []
-    middle_band, upper_band, lower_band = [], [], []
+    mid, up, low = [], [], []
     for i in range(len(series)):
         if i < period - 1:
-            middle_band.append(None)
-            upper_band.append(None)
-            lower_band.append(None)
-        else:
-            window = series[i - period + 1: i + 1]
-            sma = sum(window) / period
-            variance = sum((p - sma) ** 2 for p in window) / period
-            stddev = variance ** 0.5
-            middle_band.append(sma)
-            upper_band.append(sma + std_factor * stddev)
-            lower_band.append(sma - std_factor * stddev)
-    return middle_band, upper_band, lower_band
-
-
-def compute_indicators(df):
-    closes = df["close"].tolist()
-    df["rsi"] = rsi(closes, period=14)
-    macd_line, signal_line, hist_line = macd(closes, fast=12, slow=26, signal=9)
-    df["macd"] = macd_line
-    df["macd_signal"] = signal_line
-    df["macd_hist"] = hist_line
-    df["ema_12"] = ema(closes, 12)
-    df["ema_26"] = ema(closes, 26)
-    mb, ub, lb = bollinger_bands(closes, period=20, std_factor=2)
-    df["bb_m"] = mb
-    df["bb_u"] = ub
-    df["bb_l"] = lb
-    df["atr"] = atr(df["high"].tolist(), df["low"].tolist(), closes, ATR_PERIOD)
-    cu, cd, bu, bd = market_structure(df["high"].tolist(), df["low"].tolist(), closes, SWING_K)
-    df["choch_up"] = cu
-    df["choch_dn"] = cd
-    df["bos_up"] = bu
-    df["bos_dn"] = bd
-    highs, lows = df["high"].tolist(), df["low"].tolist()
-    df["dc_hi20"] = _donchian(highs, DC_GIRIS, max)
-    df["dc_lo20"] = _donchian(lows, DC_GIRIS, min)
-    df["dc_hi10"] = _donchian(highs, DC_CIKIS, max)
-    df["dc_lo10"] = _donchian(lows, DC_CIKIS, min)
-
-
-def _donchian(values, n, fn):
-    """i. eleman: values[i-n:i] (mevcut mum hariç önceki n mum) için max/min; ilk n mumda NaN."""
-    return [fn(values[i - n:i]) if i >= n else float("nan") for i in range(len(values))]
-
-
-def market_structure(highs, lows, closes, k=3):
-    """
-    SMC yapı kırılımları (sadece geçmişe bakar, ileriye bakma yok):
-      - Tepe/dip (swing): iki yanındaki k'şar mumdan yüksek/alçak mum; k mum sonra kesinleşir.
-      - Kapanış son kesinleşmiş tepenin ÜSTÜNDE → yukarı kırılım. Önceki kırılım aşağıysa CHoCH, değilse BOS.
-      - Kapanış son kesinleşmiş dibin ALTINDA → aşağı kırılım (aynı mantık).
-    Her tepe/dip en fazla bir kez kırılım üretir. Dönüş: 0/1 listeleri (choch_up, choch_dn, bos_up, bos_dn).
-    """
-    n = len(closes)
-    cu, cd, bu, bd = [0] * n, [0] * n, [0] * n, [0] * n
-    last_hi = last_lo = None          # kırılmamış son tepe / dip seviyesi
-    direction = 0                     # +1: son kırılım yukarı, -1: aşağı, 0: henüz yok
-    for i in range(n):
-        j = i - k                     # i anında kesinleşen aday
-        if j >= k:
-            if highs[j] == max(highs[j - k:j + k + 1]):
-                last_hi = highs[j]
-            if lows[j] == min(lows[j - k:j + k + 1]):
-                last_lo = lows[j]
-        c = closes[i]
-        if last_hi is not None and c > last_hi:
-            if direction == -1:
-                cu[i] = 1
-            else:
-                bu[i] = 1
-            direction = 1
-            last_hi = None
-        elif last_lo is not None and c < last_lo:
-            if direction == 1:
-                cd[i] = 1
-            else:
-                bd[i] = 1
-            direction = -1
-            last_lo = None
-    return cu, cd, bu, bd
+            mid.append(None), up.append(None), low.append(None)
+            continue
+        w = series[i - period + 1:i + 1]
+        sma = sum(w) / period
+        sd = (sum((p - sma) ** 2 for p in w) / period) ** 0.5
+        mid.append(sma), up.append(sma + std_factor * sd), low.append(sma - std_factor * sd)
+    return mid, up, low
 
 
 def atr(highs, lows, closes, period=14):
@@ -236,17 +105,24 @@ def atr(highs, lows, closes, period=14):
     out = [None] * n
     if n <= period:
         return out
-    trs = [highs[0] - lows[0]]
-    for i in range(1, n):
-        trs.append(max(highs[i] - lows[i],
-                       abs(highs[i] - closes[i - 1]),
-                       abs(lows[i] - closes[i - 1])))
+    trs = [highs[0] - lows[0]] + [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]),
+                                      abs(lows[i] - closes[i - 1])) for i in range(1, n)]
     value = sum(trs[1:period + 1]) / period
     out[period] = value
     for i in range(period + 1, n):
         value = (value * (period - 1) + trs[i]) / period
         out[i] = value
     return out
+
+
+def compute_indicators(df):
+    """Ortak sütunlar: ema_12, ema_26, rsi, bb_m/bb_u/bb_l, atr. Stratejiye özel olanlar strateji.hazirla()'da."""
+    closes = df["close"].tolist()
+    df["ema_12"] = ema(closes, 12)
+    df["ema_26"] = ema(closes, 26)
+    df["rsi"] = rsi(closes, 14)
+    df["bb_m"], df["bb_u"], df["bb_l"] = bollinger_bands(closes, 20, 2)
+    df["atr"] = atr(df["high"].tolist(), df["low"].tolist(), closes, ATR_PERIOD)
 
 
 def _v(x):
@@ -256,283 +132,84 @@ def _v(x):
     return float(x)
 
 
-def compute_signals(df):
-    if GIRIS_MODU != "macd":
-        return _compute_signals_new(df)
-    n = len(df)
-    buy_src = [[] for _ in range(n)]
-    sell_src = [[] for _ in range(n)]
-
-    close_ = df["close"].tolist()
-    rsi_ = [_v(x) for x in df["rsi"]]
-    macd_ = [_v(x) for x in df["macd"]]
-    sig_ = [_v(x) for x in df["macd_signal"]]
-    e12 = [_v(x) for x in df["ema_12"]]
-    e26 = [_v(x) for x in df["ema_26"]]
-    bb_u = [_v(x) for x in df["bb_u"]]
-    bb_l = [_v(x) for x in df["bb_l"]]
-
-    for i in range(1, n):
-        # RSI: 30'un altından yukarı -> AL, 70'in üstünden aşağı -> SAT
-        if rsi_[i - 1] is not None and rsi_[i] is not None:
-            if rsi_[i - 1] < 30 <= rsi_[i]:
-                buy_src[i].append("RSI")
-            if rsi_[i - 1] > 70 >= rsi_[i]:
-                sell_src[i].append("RSI")
-
-        # MACD sinyal çizgisi kesişimi
-        if None not in (macd_[i - 1], sig_[i - 1], macd_[i], sig_[i]):
-            if macd_[i - 1] < sig_[i - 1] and macd_[i] > sig_[i]:
-                buy_src[i].append("MACD")
-            if macd_[i - 1] > sig_[i - 1] and macd_[i] < sig_[i]:
-                sell_src[i].append("MACD")
-
-        # EMA12 / EMA26 kesişimi
-        if None not in (e12[i - 1], e26[i - 1], e12[i], e26[i]):
-            if e12[i - 1] < e26[i - 1] and e12[i] > e26[i]:
-                buy_src[i].append("EMA")
-            if e12[i - 1] > e26[i - 1] and e12[i] < e26[i]:
-                sell_src[i].append("EMA")
-
-        # Bollinger bandı dışında kapanış
-        if bb_u[i] is not None and bb_l[i] is not None:
-            if close_[i] < bb_l[i]:
-                buy_src[i].append("BB")
-            if close_[i] > bb_u[i]:
-                sell_src[i].append("BB")
-
-    return buy_src, sell_src
-
-
-def _compute_signals_new(df):
-    """G1 / G2 / G3 giriş sinyalleri (GIRIS_MODU'na göre tek kaynak)."""
-    n = len(df)
-    buy_src = [[] for _ in range(n)]
-    sell_src = [[] for _ in range(n)]
-    open_ = df["open"].tolist()
-    close_ = df["close"].tolist()
-    high_ = df["high"].tolist()
-    low_ = df["low"].tolist()
-    if GIRIS_MODU == "bb_donus":
-        bb_u = [_v(x) for x in df["bb_u"]]
-        bb_l = [_v(x) for x in df["bb_l"]]
-        for i in range(n):
-            if bb_l[i] is not None and low_[i] <= bb_l[i] and close_[i] > bb_l[i] and close_[i] > open_[i]:
-                buy_src[i].append("BBD")
-            if bb_u[i] is not None and high_[i] >= bb_u[i] and close_[i] < bb_u[i] and close_[i] < open_[i]:
-                sell_src[i].append("BBD")
-    elif GIRIS_MODU == "rsi_derin":
-        r = [_v(x) for x in df["rsi"]]
-        lb = RSI_DERIN_LOOKBACK
-        for i in range(lb, n):
-            prev = [x for x in r[i - lb:i] if x is not None]
-            if r[i] is None or r[i - 1] is None or len(prev) < lb:
-                continue
-            if min(prev) < RSI_DERIN_AL[0] and r[i - 1] < RSI_DERIN_AL[1] <= r[i]:
-                buy_src[i].append("RSID")
-            if max(prev) > RSI_DERIN_SAT[0] and r[i - 1] > RSI_DERIN_SAT[1] >= r[i]:
-                sell_src[i].append("RSID")
-    elif GIRIS_MODU == "trend_1d":
-        e12 = [_v(x) for x in df["ema_12"]]
-        e26 = [_v(x) for x in df["ema_26"]]
-        for i in range(1, n):
-            if None in (e12[i], e26[i], e12[i - 1], e26[i - 1]):
-                continue
-            if e12[i - 1] <= e26[i - 1] and e12[i] > e26[i]:
-                buy_src[i].append("EMAX")
-            elif e12[i - 1] >= e26[i - 1] and e12[i] < e26[i]:
-                sell_src[i].append("EMAX")
-    elif GIRIS_MODU == "trend_4h":
-        hi = [_v(x) for x in df["dc_hi20"]]
-        lo = [_v(x) for x in df["dc_lo20"]]
-        for i in range(1, n):
-            if None in (hi[i], lo[i], hi[i - 1], lo[i - 1]):
-                continue
-            if close_[i] > hi[i] and close_[i - 1] <= hi[i - 1]:     # kanalın üstünde İLK kapanış
-                buy_src[i].append("DC20")
-            elif close_[i] < lo[i] and close_[i - 1] >= lo[i - 1]:
-                sell_src[i].append("DC20")
-    elif GIRIS_MODU == "choch":
-        cu = df["choch_up"].tolist()
-        cd = df["choch_dn"].tolist()
-        for i in range(n):
-            if cu[i]:
-                buy_src[i].append("CHOCH")
-            if cd[i]:
-                sell_src[i].append("CHOCH")
-    return buy_src, sell_src
-
-
-def _pullback_trend_ok(df, idx, side):
-    """
-    G1 için trend: EMA12 > EMA26 ve EMA26 yükseliyor (SAT: tersi). Kapanışın EMA26'nın
-    neresinde olduğuna bakılmaz, çünkü derin geri çekilmede fiyat EMA26'nın altına inebilir.
-    """
-    e12 = _v(df["ema_12"][idx])
-    e26 = _v(df["ema_26"][idx])
-    if e12 is None or e26 is None or idx < 10:
-        return False
-    slope = e26 - _v(df["ema_26"][idx - 10])
-    if side == "AL":
-        return e12 > e26 and slope > 0
-    return e12 < e26 and slope < 0
-
-
-def trend_exit(df, idx, side, rule):
-    """
-    Trend modlarında iz süren çıkış: idx. (kapanmış) mumda çıkış koşulu oluştu mu?
-      rule "ema" : LONG → EMA12 < EMA26, SHORT → EMA12 > EMA26 (ters kesişim)
-      rule "dc10": LONG → kapanış < önceki 10 mumun en düşüğü, SHORT → kapanış > önceki 10 mumun en yükseği
-    Dönüş: açıklama metni ya da None. Sadece df["col"][i] erişimi kullanır.
-    """
-    close = float(df["close"][idx])
-    if rule == "ema":
-        e12, e26 = _v(df["ema_12"][idx]), _v(df["ema_26"][idx])
-        if e12 is None or e26 is None:
-            return None
-        if side == "AL" and e12 < e26:
-            return f"EMA12 EMA26'nın altına indi ({e12:.6g} < {e26:.6g})"
-        if side == "SAT" and e12 > e26:
-            return f"EMA12 EMA26'nın üstüne çıktı ({e12:.6g} > {e26:.6g})"
-        return None
-    if rule == "dc10":
-        if side == "AL":
-            lvl = _v(df["dc_lo10"][idx])
-            if lvl is not None and close < lvl:
-                return f"mum önceki {DC_CIKIS} mumun dibinin altında kapandı ({close:g} < {lvl:g})"
-        else:
-            lvl = _v(df["dc_hi10"][idx])
-            if lvl is not None and close > lvl:
-                return f"mum önceki {DC_CIKIS} mumun tepesinin üstünde kapandı ({close:g} > {lvl:g})"
-    return None
-
-
 def market_state(df, idx):
-    """Trend (YÜKSELİŞ / DÜŞÜŞ / YATAY) ve Bollinger sıkışması."""
-    e12 = _v(df["ema_12"][idx])
-    e26 = _v(df["ema_26"][idx])
+    """Trend (YÜKSELİŞ / DÜŞÜŞ / YATAY): EMA12/26 dizilimi, kapanış ve EMA26 eğimi; dar farkta YATAY."""
+    e12, e26 = _v(df["ema_12"][idx]), _v(df["ema_26"][idx])
     close = float(df["close"][idx])
-    bb_u = _v(df["bb_u"][idx])
-    bb_m = _v(df["bb_m"][idx])
-    bb_l = _v(df["bb_l"][idx])
-
-    look = 10
-    slope = e26 - _v(df["ema_26"][idx - look]) if idx >= look else 0.0
-
+    bb_u, bb_m = _v(df["bb_u"][idx]), _v(df["bb_m"][idx])
+    slope = e26 - _v(df["ema_26"][idx - 10]) if idx >= 10 else 0.0
     std = (bb_u - bb_m) / 2 if bb_u is not None and bb_m is not None else None
-
     if std is not None and std > 0 and abs(e12 - e26) < 0.3 * std:
-        trend = "YATAY"
-    elif e12 > e26 and close > e26 and slope > 0:
-        trend = "YÜKSELİŞ"
-    elif e12 < e26 and close < e26 and slope < 0:
-        trend = "DÜŞÜŞ"
-    else:
-        trend = "YATAY"
-
-    # Sıkışma: şu anki bant genişliği son 100 mumun ortalamasının %75'inden dar mı?
-    squeeze = False
-    if bb_u is not None and bb_l is not None and bb_m:
-        widths = []
-        for j in range(max(0, idx - 100), idx + 1):
-            u, l, m = _v(df["bb_u"][j]), _v(df["bb_l"][j]), _v(df["bb_m"][j])
-            if u is not None and l is not None and m:
-                widths.append((u - l) / m)
-        if len(widths) >= 20:
-            avg = sum(widths) / len(widths)
-            squeeze = widths[-1] < 0.75 * avg
-
-    return trend, squeeze
+        return "YATAY"
+    if e12 > e26 and close > e26 and slope > 0:
+        return "YÜKSELİŞ"
+    if e12 < e26 and close < e26 and slope < 0:
+        return "DÜŞÜŞ"
+    return "YATAY"
 
 
-def check_alert(df, buy_src, sell_src, htf_trend, min_indicators=MIN_INDICATORS):
+# =========================================================================
+# Strateji yükleme, alarm ve mesajlar
+# =========================================================================
+_STRATS = {}
+
+
+def load_strategy(kod):
+    """strateji_<kod>.py dosyasını yükler ve gerekli alanları kontrol eder."""
+    if kod not in _STRATS:
+        m = importlib.import_module(f"strateji_{kod}")
+        for name in ("KOD", "AD", "YON", "ZAMAN_DILIMI", "CIKIS", "giris", "hazirla"):
+            if not hasattr(m, name):
+                raise RuntimeError(f"strateji_{kod}.py içinde {name} tanımlı değil")
+        if m.ZAMAN_DILIMI not in INTERVAL_SECONDS:
+            raise RuntimeError(f"strateji_{kod}.py: geçersiz ZAMAN_DILIMI {m.ZAMAN_DILIMI!r}")
+        if m.CIKIS.get("iz") and not hasattr(m, "iz_cikis"):
+            raise RuntimeError(f"strateji_{kod}.py: CIKIS['iz'] açık ama iz_cikis() tanımlı değil")
+        _STRATS[kod] = m
+    return _STRATS[kod]
+
+
+def check_alert(strat, df, htf_trend):
     """
-    Sadece SON KAPANMIŞ mumdaki sinyale bakar. Alarm şu koşulların hepsinde verilir:
-      - sinyal tek yönlü (aynı mumda hem AL hem SAT yok)
-      - en az `min_indicators` indikatör tetiklenmiş
-      - sinyal mevcut zaman dilimindeki trendle aynı yönde (AL->YÜKSELİŞ, SAT->DÜŞÜŞ)
-      - üst zaman dilimindeki trend de aynı yönde (biliniyorsa)
-    Yatay piyasadaki sinyaller ve trende ters sinyaller alarm üretmez.
-    GIRIS_MODU macd dışındaysa işlem ZD trend şartı moda göre değişir (bkz. AYARLAR).
+    Son KAPANMIŞ mumda (len-2) stratejinin giriş kuralını uygular. Dönüş: None ya da
+    side, entry, stop, target (TP yoksa None), sources, risk_atr, risk_pct, atr_pct, time,
+    trend, htf_trend, strateji, cikis.
     """
     n = len(df)
     if n < 40:
         return None
     i = n - 2
-    if bool(buy_src[i]) == bool(sell_src[i]):     # sinyal yok ya da çelişkili
+    res = strat.giris(df, i, htf_trend)
+    if not res:
         return None
-    side = "AL" if buy_src[i] else "SAT"
-    src = buy_src[i] or sell_src[i]
-    if len(src) < min_indicators:
+    side, sources = res
+    if (strat.YON == "long" and side != "AL") or (strat.YON == "short" and side != "SAT"):
         return None
-
-    trend, squeeze = market_state(df, i)
-    wanted = "YÜKSELİŞ" if side == "AL" else "DÜŞÜŞ"
-    if GIRIS_MODU in TREND_MODES:
-        return _trend_alert(df, i, side, src, trend, squeeze, htf_trend, wanted)
-    if GIRIS_MODU == "macd":
-        if trend != wanted:                          # eski: işlem ZD trendi aynı yönde olmalı
-            return None
-    elif GIRIS_MODU == "bb_donus":
-        if not _pullback_trend_ok(df, i, side):      # G1: işlem ZD'de EMA dizilimi + eğim
-            return None
-    # G2 (rsi_derin) ve G3 (choch): işlem ZD trendi aranmaz (geri çekilmede zaten bozulur); yön üst ZD'den gelir
-    if GIRIS_MODU in ("rsi_derin", "choch") and htf_trend is None:
-        return None
-    if htf_trend is not None and htf_trend != wanted:
-        return None
-
     entry = float(df["close"][i])
     a = _v(df["atr"][i])
     if a is None or a <= 0:
         return None
-    lo = max(0, i - STOP_LOOKBACK + 1)
-
-    # Stop: son STOP_LOOKBACK mumun dibi/tepesi + yarım ATR pay.
-    # Girişe 1 ATR'den yakınsa 1 ATR'ye genişletilir; 4 ATR'den uzaksa sinyal atlanır.
-    if side == "AL":
-        swing = float(df["low"][lo:i + 1].min())
-        risk = max(entry - (swing - STOP_BUFFER_ATR * a), MIN_STOP_ATR * a)
-        stop = entry - risk
-        target = entry + TP_R * risk
+    cikis = strat.CIKIS
+    if hasattr(strat, "stop"):                       # strateji kendi stop'unu hesaplayabilir
+        stop = strat.stop(df, i, side, entry, a)
+        if stop is None:
+            return None
     else:
-        swing = float(df["high"][lo:i + 1].max())
-        risk = max((swing + STOP_BUFFER_ATR * a) - entry, MIN_STOP_ATR * a)
-        stop = entry + risk
-        target = entry - TP_R * risk
-    if risk > MAX_STOP_ATR * a:
-        print(f"  sinyal atlandı: stop çok uzak ({risk / a:.1f} ATR, %{risk / entry * 100:.2f})")
+        stop = entry - cikis["stop_atr"] * a if side == "AL" else entry + cikis["stop_atr"] * a
+    risk = abs(entry - stop)
+    if stop <= 0 or risk <= 0:
         return None
-    if stop <= 0 or target <= 0:
-        return None
-
+    target = None
+    if cikis.get("tp_r"):
+        target = entry + cikis["tp_r"] * risk if side == "AL" else entry - cikis["tp_r"] * risk
+        if target <= 0:
+            return None
     return {
-        "side": side, "sources": src, "trend": trend, "htf_trend": htf_trend,
-        "squeeze": squeeze, "time": df["datetime"][i], "entry": entry,
-        "stop": stop, "target": target, "risk_pct": risk / entry * 100,
-        "atr_pct": a / entry * 100, "risk_atr": risk / a,
-    }
-
-
-def _trend_alert(df, i, side, src, trend, squeeze, htf_trend, wanted):
-    """T1/T2: stop = giriş ∓ 2,5 ATR, TP yok (target sadece uyumluluk için). T2 günlük trend ister."""
-    if GIRIS_MODU == "trend_4h" and htf_trend != wanted:
-        return None
-    entry = float(df["close"][i])
-    a = _v(df["atr"][i])
-    if a is None or a <= 0:
-        return None
-    risk = TREND_STOP_ATR * a
-    stop = entry - risk if side == "AL" else entry + risk
-    target = entry + TP_R * risk if side == "AL" else entry - TP_R * risk
-    if stop <= 0 or target <= 0:
-        return None
-    return {
-        "side": side, "sources": src, "trend": trend, "htf_trend": htf_trend,
-        "squeeze": squeeze, "time": df["datetime"][i], "entry": entry,
-        "stop": stop, "target": target, "risk_pct": risk / entry * 100,
-        "atr_pct": a / entry * 100, "risk_atr": risk / a,
-        "exit_mode": "trend", "exit_rule": "ema" if GIRIS_MODU == "trend_1d" else "dc10",
+        "side": side, "sources": sources, "entry": entry, "stop": stop, "target": target,
+        "risk_pct": risk / entry * 100, "atr_pct": a / entry * 100, "risk_atr": risk / a,
+        "time": df["datetime"][i], "trend": market_state(df, i), "htf_trend": htf_trend,
+        "strateji": strat.KOD, "strateji_ad": strat.AD, "cikis": dict(cikis),
+        "cikis_metni": strat.cikis_metni(side) if hasattr(strat, "cikis_metni") else None,
     }
 
 
@@ -544,28 +221,36 @@ def fmt_price(p):
     return f"{p:.8g}"
 
 
-def alert_text(symbol, timeframe, a):
-    htf = HIGHER_TF.get(timeframe)
-    head = ("🟢 AL" if a["side"] == "AL" else "🔴 SAT") + f" – {symbol} {timeframe}"
+def _yon_txt(yon):
+    return {"long": "LONG", "short": "SHORT"}.get(yon, "LONG + SHORT")
+
+
+def strategy_card(strat):
+    """Sitedeki formatta strateji tanıtımı."""
+    coins = getattr(strat, "COINLER", None) or SYMBOLS
+    names = ", ".join(c.split("_")[0] for c in coins[:6]) + (f" +{len(coins) - 6}" if len(coins) > 6 else "")
+    return (f"🏆 Strateji: {strat.AD} - {_yon_txt(strat.YON)}\n"
+            f"🏛️ Piyasa: Kripto ({names})\n\n"
+            f"{getattr(strat, 'ACIKLAMA', '')}")
+
+
+def alert_text(strat, symbol, a):
+    tf = strat.ZAMAN_DILIMI
+    close_t = (a["time"] + datetime.timedelta(seconds=INTERVAL_SECONDS[tf])).strftime("%d.%m %H:%M")
+    head = ("🟢 LONG" if a["side"] == "AL" else "🔴 SHORT") + f" – {symbol} {tf}"
+    htf = getattr(strat, "UST_ZAMAN_DILIMI", None)
     lines = [
         head,
-        f"Fiyat: {fmt_price(a['entry'])} (mum kapanışı "
-        f"{(a['time'] + datetime.timedelta(seconds=INTERVAL_SECONDS[timeframe])).strftime('%d.%m %H:%M')})",
-        f"Sinyal: {'+'.join(a['sources'])}",
-        f"Trend {timeframe}: {a['trend']}" + (f" | {htf}: {a['htf_trend'] or '-'}" if htf else ""),
-        f"🛑 SL: {fmt_price(a['stop'])} → zarar: -%{a['risk_pct']:.2f}",
-        (f"🎯 TP yok – iz süren çıkış: "
-         + ("ters EMA12/26 kesişimi" if a.get("exit_rule") == "ema"
-            else f"mum önceki {DC_CIKIS} mumun {'dibinin altında' if a['side'] == 'AL' else 'tepesinin üstünde'} kapanınca")
-         if a.get("exit_mode") == "trend" else
-         f"🎯 TP (1:{TP_R:g}): {fmt_price(a['target'])} → kâr: +%{TP_R * a['risk_pct']:.2f}"),
-        f"Stop mesafesi: {a['risk_atr']:.1f} ATR (1 ATR = %{a['atr_pct']:.2f})",
-        "(yüzdeler sinyal fiyatından girildiğinde, kaldıraçsız)",
+        f"🏆 {strat.AD}",
+        f"Fiyat: {fmt_price(a['entry'])} (mum kapanışı {close_t}) | Sinyal: {'+'.join(a['sources'])}",
+        f"Trend {tf}: {a['trend']}" + (f" | {htf}: {a['htf_trend'] or '-'}" if htf else ""),
+        f"🛑 SL: {fmt_price(a['stop'])} → -%{a['risk_pct']:.2f} ({a['risk_atr']:.1f} ATR)",
     ]
-    if a["side"] == "SAT":
-        lines.append("Not: spotta short açılamaz; elindekini satmak ya da vadeli hesap.")
-    if a["squeeze"]:
-        lines.append("Not: Bollinger bantları sıkışık.")
+    if a["target"] is not None:
+        lines.append(f"🎯 TP: {fmt_price(a['target'])} → +%{a['cikis']['tp_r'] * a['risk_pct']:.2f}")
+    if a["cikis"].get("iz") and hasattr(strat, "cikis_metni"):
+        lines.append(f"🚪 Çıkış: {strat.cikis_metni(a['side'])}")
+    lines.append("(yüzdeler sinyal fiyatından, kaldıraçsız)")
     return "\n".join(lines)
 
 
@@ -575,37 +260,29 @@ def alert_text(symbol, timeframe, a):
 _CACHE = {}
 
 
-def fetch_candles(symbol, interval, limit=CANDLE_LIMIT):
-    """Aynı çalıştırmada aynı veriyi iki kez çekmemek için önbellekli."""
+def fetch_candles(symbol, interval):
+    """Gate.io mumları + ortak indikatörler. Aynı çalıştırmada aynı veri bir kez çekilir."""
     key = (symbol, interval)
     if key not in _CACHE:
-        _CACHE[key] = _fetch_candles(symbol, interval, CANDLE_LIMIT)
+        q = urllib.parse.urlencode({"currency_pair": symbol, "interval": interval, "limit": CANDLE_LIMIT})
+        req = urllib.request.Request(f"https://api.gateio.ws/api/v4/spot/candlesticks?{q}",
+                                     headers={"Accept": "application/json", "User-Agent": "signal-bot"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")
+            if "INVALID_CURRENCY_PAIR" in body:
+                raise RuntimeError("Gate.io'da böyle bir parite yok, listeden çıkar")
+            raise RuntimeError(f"HTTP {e.code}: {body[:200]}")
+        # Gate: [zaman, hacim(quote), kapanış, yüksek, düşük, açılış, ...]
+        rows = [[datetime.datetime.fromtimestamp(int(c[0]), tz=TZ).replace(tzinfo=None),
+                 float(c[5]), float(c[3]), float(c[4]), float(c[2])] for c in data]
+        df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close"])
+        df = df.sort_values("datetime").reset_index(drop=True)
+        compute_indicators(df)
+        _CACHE[key] = df
     return _CACHE[key].copy()
-
-
-def _fetch_candles(symbol, interval, limit=CANDLE_LIMIT):
-    """Gate.io herkese açık REST uç noktasından mum çeker (API anahtarı gerekmez)."""
-    q = urllib.parse.urlencode({"currency_pair": symbol, "interval": interval, "limit": limit})
-    req = urllib.request.Request(f"https://api.gateio.ws/api/v4/spot/candlesticks?{q}",
-                                 headers={"Accept": "application/json", "User-Agent": "signal-bot"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="ignore")
-        if "INVALID_CURRENCY_PAIR" in body:
-            raise RuntimeError("Gate.io'da böyle bir parite yok, listeden çıkar")
-        raise RuntimeError(f"HTTP {e.code}: {body[:200]}")
-
-    rows = []
-    for c in data:
-        dt = datetime.datetime.fromtimestamp(int(c[0]), tz=TZ).replace(tzinfo=None)
-        rows.append([dt, float(c[5]), float(c[3]), float(c[4]), float(c[2]), float(c[1])])
-    df = pd.DataFrame(rows, columns=["datetime", "open", "high", "low", "close", "volume"])
-    df.sort_values("datetime", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    compute_indicators(df)
-    return df
 
 
 def send_telegram(text):
@@ -641,24 +318,12 @@ def save_state(state):
 
 
 # =========================================================================
-# Ana akış
+# Tarama
 # =========================================================================
 def last_closed_open_ts(timeframe, now):
     """Son kapanmış mumun açılış zamanı (epoch saniye)."""
     sec = INTERVAL_SECONDS[timeframe]
     return int(now // sec * sec - sec)
-
-
-def try_trade(symbol, timeframe, alert):
-    import binance_trader
-    try:
-        opened, msg = binance_trader.open_trade(symbol, alert, timeframe)
-    except Exception as e:
-        opened, msg = False, f"❌ {symbol} {timeframe}: işlem açılamadı – {e}"
-    print("  " + msg.replace("\n", " | "))
-    kind = "open" if opened else ("skip" if msg.startswith("⏭") else "error")
-    _log_event(kind, symbol, tf=timeframe, msg=msg.split("\n")[0])
-    send_telegram(msg)
 
 
 def _log_event(kind, symbol=None, **data):
@@ -669,41 +334,51 @@ def _log_event(kind, symbol=None, **data):
         print(f"  olay kaydedilemedi ({e})")
 
 
-def scan_timeframe(timeframe, state, errors, report):
-    htf = HIGHER_TF.get(timeframe)
+def try_trade(symbol, strat, alert):
+    import binance_trader
+    try:
+        opened, msg = binance_trader.open_trade(symbol, alert, strat.ZAMAN_DILIMI)
+    except Exception as e:
+        opened, msg = False, f"❌ {symbol} {strat.ZAMAN_DILIMI}: işlem açılamadı – {e}"
+    print("  " + msg.replace("\n", " | "))
+    kind = "open" if opened else ("skip" if msg.startswith("⏭") else "error")
+    _log_event(kind, symbol, tf=strat.ZAMAN_DILIMI, strateji=strat.KOD, msg=msg.split("\n")[0])
+    send_telegram(msg)
+
+
+def scan_strategy(strat, state, errors, report):
+    tf, htf = strat.ZAMAN_DILIMI, getattr(strat, "UST_ZAMAN_DILIMI", None)
     sent = 0
-    for symbol in SYMBOLS:
+    for symbol in getattr(strat, "COINLER", None) or SYMBOLS:
         try:
-            df = fetch_candles(symbol, timeframe)
+            df = fetch_candles(symbol, tf)
             if len(df) < 40:
                 raise RuntimeError("yeterli mum yok")
-            buy_src, sell_src = compute_signals(df)
-
+            strat.hazirla(df)
             htf_trend = None
-            if htf and GIRIS_MODU != "trend_1d":        # T1 üst zaman dilimine bakmaz (7d çekilmez)
+            if htf:
                 hdf = fetch_candles(symbol, htf)
                 if len(hdf) >= 40:
-                    htf_trend, _ = market_state(hdf, len(hdf) - 2)
+                    htf_trend = market_state(hdf, len(hdf) - 2)
+            trend = market_state(df, len(df) - 2)
+            report.append(f"{symbol} {tf}: {trend} / {htf or '-'}: {htf_trend or '-'}")
 
-            trend, _ = market_state(df, len(df) - 2)
-            report.append(f"{symbol} {timeframe}: {trend} / {htf or '-'}: {htf_trend or '-'}")
-
-            alert = check_alert(df, buy_src, sell_src, htf_trend)
-            if alert:
-                key = f"{symbol}|{timeframe}|{alert['time'].isoformat()}|{alert['side']}"
-                if key in state["alerted"]:
-                    print(f"{symbol} {timeframe}: sinyal daha önce gönderildi, atlandı")
-                elif send_telegram(alert_text(symbol, timeframe, alert)):
-                    state["alerted"][key] = time.time()
-                    sent += 1
-                    print(f"{symbol} {timeframe}: {alert['side']} sinyali gönderildi")
-                    _log_event("signal", symbol, tf=timeframe, side=alert["side"])
-                    if TRADING_ENABLED:
-                        try_trade(symbol, timeframe, alert)
-            else:
-                print(f"{symbol} {timeframe}: alarm yok ({trend})")
+            alert = check_alert(strat, df, htf_trend)
+            if not alert:
+                print(f"[{strat.KOD}] {symbol}: sinyal yok ({trend})")
+                continue
+            key = f"{strat.KOD}|{symbol}|{alert['time'].isoformat()}|{alert['side']}"
+            if key in state["alerted"]:
+                print(f"[{strat.KOD}] {symbol}: sinyal daha önce gönderildi, atlandı")
+            elif send_telegram(alert_text(strat, symbol, alert)):
+                state["alerted"][key] = time.time()
+                sent += 1
+                print(f"[{strat.KOD}] {symbol}: {alert['side']} sinyali gönderildi")
+                _log_event("signal", symbol, tf=tf, strateji=strat.KOD, side=alert["side"])
+                if TRADING_ENABLED:
+                    try_trade(symbol, strat, alert)
         except Exception as e:
-            msg = f"{symbol} {timeframe}: {e}"
+            msg = f"[{strat.KOD}] {symbol} {tf}: {e}"
             if msg not in errors:
                 errors.append(msg)
             print(f"HATA – {msg}")
@@ -711,18 +386,47 @@ def scan_timeframe(timeframe, state, errors, report):
     return sent
 
 
+def _test_message(strats, scanned, total, errors, sent, report, remote):
+    now = datetime.datetime.now(TZ).strftime("%d.%m %H:%M")
+    msg = [f"✅ {'Durum raporu' if remote and not TEST_RUN else 'Test'}: sinyal botu çalışıyor ({now})",
+           f"Stratejiler: {', '.join(s.KOD for s in strats)} | taranan: {', '.join(scanned) or '-'} | "
+           f"{total - len(errors)}/{total} tarama başarılı | {sent} sinyal gönderildi"]
+    if TRADING_ENABLED:
+        import binance_trader
+        msg += ["", binance_trader.status_line()]
+    else:
+        msg += ["", f"ℹ️ Otomatik işlem KAPALI (TRADING_ENABLED={os.environ.get('TRADING_ENABLED', 'tanımsız')!r})"]
+    for s in strats:
+        msg += ["", strategy_card(s)]
+    dist = {}
+    for line in report:
+        trend = line.split(" / ")[0].split(": ")[-1]
+        dist[trend] = dist.get(trend, 0) + 1
+    if dist:
+        msg += ["", "Trend dağılımı: " + " · ".join(f"{t} {n}" for t, n in sorted(dist.items(), key=lambda kv: -kv[1]))]
+    msg += ["", "Trendler:"] + report
+    if errors:
+        msg += ["", "Hatalar:"] + errors
+    return "\n".join(msg)
+
+
 def main():
-    bad = [t for t in TIMEFRAMES if t not in INTERVAL_SECONDS]
-    if bad or not TIMEFRAMES:
-        print(f"Geçersiz TIMEFRAMES: {bad or TIMEFRAMES}")
+    strats = []
+    for kod in STRATEJILER:
+        try:
+            strats.append(load_strategy(kod))
+        except Exception as e:
+            print(f"Strateji yüklenemedi ({kod}): {e}")
+            send_telegram(f"❌ Strateji yüklenemedi: {kod} – {e}")
+    if not strats:
         sys.exit(1)
 
     state = load_state()
     state.setdefault("last_scan", {})
 
     # Uzaktan durum isteği: ayarlar.env'deki RAPOR_ISTEGI değeri değişince bir kez
-    # test mesajı (trendler + Binance durumu) ve günün raporu gönderilir. SSH gerekmez.
-    remote_req = os.environ.get("RAPOR_ISTEGI", "").strip().strip('"').strip("'")
+    # test mesajı (strateji kartları, trendler, Binance durumu) ve günün raporu gönderilir.
+    remote_req = _env("RAPOR_ISTEGI")
     remote = bool(remote_req) and state.get("last_remote_request") != remote_req
     if remote:
         state["last_remote_request"] = remote_req
@@ -732,76 +436,51 @@ def main():
 
     if TRADING_ENABLED:
         import binance_trader
-        binance_trader.manage_positions(send_telegram)   # yarı kâr → SL girişe, kapanış bildirimi
         import rapor
+        binance_trader.manage_positions(send_telegram)   # yarı kâr, iz süren çıkış, süre, kapanış bildirimi
         rapor.maybe_send_daily(send_telegram, binance_trader.daily_numbers, force=REPORT_NOW or remote)
         rapor.maybe_send_weekly(send_telegram, binance_trader.status_line, force=REPORT_NOW)
         if REPORT_NOW:
             print("Rapor gönderildi.")
             return
         binance_trader.cleanup_orphan_orders()
-    now_ts = time.time()
-    errors, report, sent, scanned = [], [], 0, []
 
-    for tf in TIMEFRAMES:
-        closed = last_closed_open_ts(tf, now_ts)
-        # Bu zaman diliminde yeni bir mum kapanmadıysa atla (test çalıştırmasında hepsi taranır)
-        if not test_mode and state["last_scan"].get(tf, 0) >= closed:
-            print(f"{tf}: yeni mum kapanmadı, atlandı")
+    now_ts = time.time()
+    errors, report, sent, scanned, total = [], [], 0, [], 0
+    for strat in strats:
+        closed = last_closed_open_ts(strat.ZAMAN_DILIMI, now_ts)
+        last = state["last_scan"].get(strat.KOD, state["last_scan"].get(strat.ZAMAN_DILIMI, 0))
+        if not test_mode and last >= closed:
+            print(f"[{strat.KOD}] yeni {strat.ZAMAN_DILIMI} mum kapanmadı, atlandı")
             continue
         n_err = len(errors)
-        sent += scan_timeframe(tf, state, errors, report)
-        scanned.append(tf)
-        if len(errors) - n_err < len(SYMBOLS):      # en az bir coin tarandıysa
-            state["last_scan"][tf] = closed
+        coins = getattr(strat, "COINLER", None) or SYMBOLS
+        sent += scan_strategy(strat, state, errors, report)
+        scanned.append(strat.KOD)
+        total += len(coins)
+        if len(errors) - n_err < len(coins):          # en az bir coin tarandıysa
+            state["last_scan"][strat.KOD] = closed
 
-    now = datetime.datetime.now(TZ).strftime("%d.%m %H:%M")
-    total = len(SYMBOLS) * len(scanned)
     if test_mode:
-        msg = [f"✅ {'Durum raporu' if remote and not TEST_RUN else 'Test'}: sinyal botu çalışıyor ({now})",
-               f"Zaman dilimleri: {', '.join(scanned)} | {len(SYMBOLS)} coin | "
-               f"{total - len(errors)}/{total} tarama başarılı | {sent} sinyal gönderildi"]
-        if TRADING_ENABLED:
-            import binance_trader
-            msg += ["", binance_trader.status_line()]
-        else:
-            msg += ["", f"ℹ️ Otomatik işlem KAPALI (TRADING_ENABLED={os.environ.get('TRADING_ENABLED', 'tanımsız')!r})"]
-        # Zaman dilimine göre trend dağılımı (sinyal yoksa sebebi genelde burada görünür)
-        dist = {}
-        for line in report:
-            try:
-                head = line.split(" / ")[0]                 # "BTC_USDT 15m: YATAY"
-                tf_part, trend = head.split(": ")
-                tf_name = tf_part.split()[-1]
-                dist.setdefault(tf_name, {}).setdefault(trend, 0)
-                dist[tf_name][trend] += 1
-            except ValueError:
-                continue
-        if dist:
-            msg += ["", "Trend dağılımı:"] + [
-                f"  {k}: " + " · ".join(f"{t} {n}" for t, n in sorted(v.items(), key=lambda kv: -kv[1]))
-                for k, v in dist.items()]
-        msg += ["", "Trendler:"] + report
-        if errors:
-            msg += ["", "Hatalar:"] + errors
-        send_telegram("\n".join(msg))
+        send_telegram(_test_message(strats, scanned, total, errors, sent, report, remote))
     elif errors and time.time() - state.get("last_error_msg", 0) > 6 * 3600:
-        send_telegram(f"⚠️ Sinyal botu ({now}): {len(errors)}/{total} tarama başarısız\n"
-                      + "\n".join(errors[:10]))
+        now = datetime.datetime.now(TZ).strftime("%d.%m %H:%M")
+        send_telegram(f"⚠️ Sinyal botu ({now}): {len(errors)}/{total} tarama başarısız\n" + "\n".join(errors[:10]))
         state["last_error_msg"] = time.time()
 
     save_state(state)
     print(f"Bitti: taranan {scanned}, {sent} sinyal, {len(errors)} hata")
-      # Backtest: ayarlar.env'deki BACKTEST_ISTEGI değişince başlar, canlı işten sonra kalan sürede ilerler
+
+    # Backtest: ayarlar.env'deki BACKTEST_ISTEGI değişince başlar, canlı işten sonra kalan sürede ilerler
     if not TEST_RUN:
         try:
             import backtest
             backtest.adim(send_telegram)
         except Exception as e:
             print(f"Backtest adımı hata verdi: {e}")
-          
+
     if total and len(errors) == total:
-        sys.exit(1)   # hepsi başarısızsa GitHub da e-posta ile haber verir
+        sys.exit(1)
 
 
 if __name__ == "__main__":
