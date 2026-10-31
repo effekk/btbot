@@ -54,6 +54,20 @@ STOP_BUFFER_ATR = 0.5     # stop, dibin/tepenin bu kadar ATR ötesine konur (fit
 MIN_STOP_ATR = 1.0        # stop girişe en az bu kadar ATR uzak olmalı (daha yakınsa genişletilir)
 TP_R = 1.5                # TP, stop mesafesinin kaç katı uzakta (1.5 = 1:1,5). Önceden 2.0
 MAX_STOP_ATR = 4.0        # stop bundan uzaksa risk çok büyük: sinyal gönderilmez
+
+# Giriş modu (ayarlar.env → GIRIS_MODU):
+#   macd      : eski davranış (RSI/MACD/EMA/BB, işlem ZD trendi + üst ZD trendi)
+#   bb_donus  : G1 – trend içinde mum Bollinger bandına değip bandın içinde, yön lehine kapanır
+#   rsi_derin : G2 – üst ZD trendi yönünde; işlem ZD'de RSI son 5 mumda 35 altına inmiş, şimdi 40'ı yukarı keser (SAT: 65 / 60)
+#   choch     : G3 – üst ZD trendi yönünde, işlem ZD'de yapı kırılır (CHoCH: son tepe/dip üstünde/altında kapanış)
+GIRIS_MODU = os.environ.get("GIRIS_MODU", "macd").strip().strip('"').strip("'").strip().lower() or "macd"
+if GIRIS_MODU not in ("macd", "bb_donus", "rsi_derin", "choch"):
+    print(f"Bilinmeyen GIRIS_MODU={GIRIS_MODU!r}, 'macd' kullanılıyor")
+    GIRIS_MODU = "macd"
+RSI_DERIN_LOOKBACK = 5           # G2: RSI'nin derin bölgeye indiği son kaç mum
+RSI_DERIN_AL = (35, 40)          # G2 AL: önce < 35, sonra 40'ı yukarı kesme
+RSI_DERIN_SAT = (65, 60)         # G2 SAT: önce > 65, sonra 60'ı aşağı kesme
+SWING_K = 3                      # G3: tepe/dip = iki yanındaki 3'er mumdan yüksek/alçak (3 mum sonra kesinleşir)
 CANDLE_LIMIT = 200
 
 INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
@@ -154,6 +168,48 @@ def compute_indicators(df):
     df["bb_u"] = ub
     df["bb_l"] = lb
     df["atr"] = atr(df["high"].tolist(), df["low"].tolist(), closes, ATR_PERIOD)
+    cu, cd, bu, bd = market_structure(df["high"].tolist(), df["low"].tolist(), closes, SWING_K)
+    df["choch_up"] = cu
+    df["choch_dn"] = cd
+    df["bos_up"] = bu
+    df["bos_dn"] = bd
+
+
+def market_structure(highs, lows, closes, k=3):
+    """
+    SMC yapı kırılımları (sadece geçmişe bakar, ileriye bakma yok):
+      - Tepe/dip (swing): iki yanındaki k'şar mumdan yüksek/alçak mum; k mum sonra kesinleşir.
+      - Kapanış son kesinleşmiş tepenin ÜSTÜNDE → yukarı kırılım. Önceki kırılım aşağıysa CHoCH, değilse BOS.
+      - Kapanış son kesinleşmiş dibin ALTINDA → aşağı kırılım (aynı mantık).
+    Her tepe/dip en fazla bir kez kırılım üretir. Dönüş: 0/1 listeleri (choch_up, choch_dn, bos_up, bos_dn).
+    """
+    n = len(closes)
+    cu, cd, bu, bd = [0] * n, [0] * n, [0] * n, [0] * n
+    last_hi = last_lo = None          # kırılmamış son tepe / dip seviyesi
+    direction = 0                     # +1: son kırılım yukarı, -1: aşağı, 0: henüz yok
+    for i in range(n):
+        j = i - k                     # i anında kesinleşen aday
+        if j >= k:
+            if highs[j] == max(highs[j - k:j + k + 1]):
+                last_hi = highs[j]
+            if lows[j] == min(lows[j - k:j + k + 1]):
+                last_lo = lows[j]
+        c = closes[i]
+        if last_hi is not None and c > last_hi:
+            if direction == -1:
+                cu[i] = 1
+            else:
+                bu[i] = 1
+            direction = 1
+            last_hi = None
+        elif last_lo is not None and c < last_lo:
+            if direction == 1:
+                cd[i] = 1
+            else:
+                bd[i] = 1
+            direction = -1
+            last_lo = None
+    return cu, cd, bu, bd
 
 
 def atr(highs, lows, closes, period=14):
@@ -183,6 +239,8 @@ def _v(x):
 
 
 def compute_signals(df):
+    if GIRIS_MODU != "macd":
+        return _compute_signals_new(df)
     n = len(df)
     buy_src = [[] for _ in range(n)]
     sell_src = [[] for _ in range(n)]
@@ -226,6 +284,60 @@ def compute_signals(df):
                 sell_src[i].append("BB")
 
     return buy_src, sell_src
+
+
+def _compute_signals_new(df):
+    """G1 / G2 / G3 giriş sinyalleri (GIRIS_MODU'na göre tek kaynak)."""
+    n = len(df)
+    buy_src = [[] for _ in range(n)]
+    sell_src = [[] for _ in range(n)]
+    open_ = df["open"].tolist()
+    close_ = df["close"].tolist()
+    high_ = df["high"].tolist()
+    low_ = df["low"].tolist()
+    if GIRIS_MODU == "bb_donus":
+        bb_u = [_v(x) for x in df["bb_u"]]
+        bb_l = [_v(x) for x in df["bb_l"]]
+        for i in range(n):
+            if bb_l[i] is not None and low_[i] <= bb_l[i] and close_[i] > bb_l[i] and close_[i] > open_[i]:
+                buy_src[i].append("BBD")
+            if bb_u[i] is not None and high_[i] >= bb_u[i] and close_[i] < bb_u[i] and close_[i] < open_[i]:
+                sell_src[i].append("BBD")
+    elif GIRIS_MODU == "rsi_derin":
+        r = [_v(x) for x in df["rsi"]]
+        lb = RSI_DERIN_LOOKBACK
+        for i in range(lb, n):
+            prev = [x for x in r[i - lb:i] if x is not None]
+            if r[i] is None or r[i - 1] is None or len(prev) < lb:
+                continue
+            if min(prev) < RSI_DERIN_AL[0] and r[i - 1] < RSI_DERIN_AL[1] <= r[i]:
+                buy_src[i].append("RSID")
+            if max(prev) > RSI_DERIN_SAT[0] and r[i - 1] > RSI_DERIN_SAT[1] >= r[i]:
+                sell_src[i].append("RSID")
+    elif GIRIS_MODU == "choch":
+        cu = df["choch_up"].tolist()
+        cd = df["choch_dn"].tolist()
+        for i in range(n):
+            if cu[i]:
+                buy_src[i].append("CHOCH")
+            if cd[i]:
+                sell_src[i].append("CHOCH")
+    return buy_src, sell_src
+
+
+def _pullback_trend_ok(df, idx, side):
+    """
+    G1 için trend: EMA12 > EMA26 ve EMA26 yükseliyor (SAT: tersi). Kapanışın EMA26'nın
+    neresinde olduğuna bakılmaz, çünkü derin geri çekilmede fiyat EMA26'nın altına inebilir.
+    """
+    e12 = _v(df["ema_12"][idx])
+    e26 = _v(df["ema_26"][idx])
+    if e12 is None or e26 is None or idx < 10:
+        return False
+    slope = e26 - _v(df["ema_26"][idx - 10])
+    if side == "AL":
+        return e12 > e26 and slope > 0
+    return e12 < e26 and slope < 0
 
 
 def market_state(df, idx):
@@ -274,6 +386,7 @@ def check_alert(df, buy_src, sell_src, htf_trend, min_indicators=MIN_INDICATORS)
       - sinyal mevcut zaman dilimindeki trendle aynı yönde (AL->YÜKSELİŞ, SAT->DÜŞÜŞ)
       - üst zaman dilimindeki trend de aynı yönde (biliniyorsa)
     Yatay piyasadaki sinyaller ve trende ters sinyaller alarm üretmez.
+    GIRIS_MODU macd dışındaysa işlem ZD trend şartı moda göre değişir (bkz. AYARLAR).
     """
     n = len(df)
     if n < 40:
@@ -288,7 +401,14 @@ def check_alert(df, buy_src, sell_src, htf_trend, min_indicators=MIN_INDICATORS)
 
     trend, squeeze = market_state(df, i)
     wanted = "YÜKSELİŞ" if side == "AL" else "DÜŞÜŞ"
-    if trend != wanted:
+    if GIRIS_MODU == "macd":
+        if trend != wanted:                          # eski: işlem ZD trendi aynı yönde olmalı
+            return None
+    elif GIRIS_MODU == "bb_donus":
+        if not _pullback_trend_ok(df, i, side):      # G1: işlem ZD'de EMA dizilimi + eğim
+            return None
+    # G2 (rsi_derin) ve G3 (choch): işlem ZD trendi aranmaz (geri çekilmede zaten bozulur); yön üst ZD'den gelir
+    if GIRIS_MODU in ("rsi_derin", "choch") and htf_trend is None:
         return None
     if htf_trend is not None and htf_trend != wanted:
         return None
