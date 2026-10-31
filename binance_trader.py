@@ -9,6 +9,9 @@ Sinyal botu bir sinyal bulduğunda `open_trade(...)` çağrılır:
   3. ISOLATED marjin, piyasa emriyle giriş.
   4. SL (STOP_MARKET) ve TP (TAKE_PROFIT_MARKET) "pozisyonun tamamını kapat" emirleri.
      SL konamazsa pozisyon güvenlik için hemen piyasa emriyle kapatılır.
+  Trend modlarında (alert["exit_mode"] == "trend"): sadece SL konur; TP, yarı kâr, süre sınırı ve
+  yapı çıkışı yoktur. Her yeni mum kapanışında iz süren çıkış kuralı (signal_bot.trend_exit)
+  kontrol edilir; oluşursa pozisyon piyasa fiyatından kapatılır (çıkış türü "İZ").
 
 Ayarlar (ortam değişkenleri):
   BINANCE_API_KEY, BINANCE_API_SECRET   – GitHub Secrets
@@ -346,7 +349,7 @@ def _record_close(symbol, plan, net, exit_type, notify):
     """Kapanan işlemi rapor kaydına yazar; çıkış türünü (SL/TP/GİRİŞ/SÜRE/ELLE) belirler."""
     entry = plan["entry"]
     sl = plan.get("sl") or float(plan["sl_str"])
-    tp = float(plan["tp_str"])
+    tp = float(plan["tp_str"]) if plan.get("tp_str") else None      # trend modunda TP yok
     risk = plan.get("risk_usdt") or plan["qty"] * abs(entry - sl)
     partial = bool(plan.get("be_done") and plan.get("half", 0) > 0)
     close_side = "SELL" if plan["side"] == "AL" else "BUY"
@@ -355,7 +358,7 @@ def _record_close(symbol, plan, net, exit_type, notify):
         tol = 0.15 * abs(entry - sl)
         if px is None:
             exit_type = "?"
-        elif abs(px - tp) <= tol:
+        elif tp is not None and abs(px - tp) <= tol:
             exit_type = "TP"
         elif partial and abs(px - entry) <= tol:
             exit_type = "GİRİŞ"
@@ -465,6 +468,33 @@ def _structure_broken(symbol, plan):
     return None
 
 
+def _trend_exit_hit(symbol, plan):
+    """
+    Trend modu: işlemin zaman diliminde YENİ kapanan mumda çıkış kuralı oluştu mu?
+    Kural signal_bot.trend_exit ile aynı (ema: ters kesişim, dc10: 10 mumluk kanal dışında kapanış).
+    Her mum için bir kez kontrol eder (plan["exit_checked"]). Dönüş: açıklama metni ya da None.
+    """
+    import pandas as pd
+    import signal_bot as sb
+    tf = plan.get("tf") or "4h"
+    sec = TF_SECONDS.get(tf, 14400)
+    last_open = int(time.time()) // sec * sec - sec           # son kapanmış mumun açılışı
+    if plan.get("exit_checked", 0) >= last_open:
+        return None
+    if last_open + sec <= plan["opened_ms"] / 1000:          # mum, işlem açılmadan önce kapanmış
+        plan["exit_checked"] = last_open
+        return None
+    rows = _request("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": tf, "limit": 200}, signed=False)
+    df = pd.DataFrame([[int(r[0]) // 1000, float(r[1]), float(r[2]), float(r[3]), float(r[4])] for r in rows],
+                      columns=["ts", "open", "high", "low", "close"])
+    hit = df.index[df["ts"] == last_open]
+    if len(df) < 40 or not len(hit):
+        return None                                           # mum henüz gelmedi: sonraki çalıştırmada tekrar dene
+    plan["exit_checked"] = last_open
+    sb.compute_indicators(df)
+    return sb.trend_exit(df, int(hit[0]), plan["side"], plan.get("exit_rule") or "dc10")
+
+
 def manage_positions(notify):
     """
     Her çalıştırmada (dakikada bir) çağrılır:
@@ -529,6 +559,43 @@ def manage_positions(notify):
                 except Exception as e2:
                     notify(f"❌ {symbol}: SL girişe konamadı ve kalan pozisyon kapatılamadı – ELLE KONTROL ET! ({e2})")
             plan["be_done"] = True
+            changed = True
+            continue
+
+        # Trend modu: iz süren çıkış (yapı çıkışı ve süre sınırı uygulanmaz)
+        if plan.get("exit_mode") == "trend":
+            before = plan.get("exit_checked")
+            try:
+                why = _trend_exit_hit(symbol, plan)
+            except Exception as e:
+                print(f"  {symbol}: iz süren çıkış kontrolü yapılamadı ({e})")
+                why = None
+            if plan.get("exit_checked") != before:
+                changed = True
+            if not why:
+                continue
+            amt_str = f"{amt:.{_decimals(plan['step'])}f}"
+            try:
+                _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
+            except Exception as e:
+                if not plan.get("trail_close_error"):
+                    notify(f"❌ {symbol}: çıkış sinyali geldi ama pozisyon kapatılamadı – ELLE KONTROL ET! ({e})")
+                    plan["trail_close_error"] = True
+                    plan["exit_checked"] = before or 0          # sonraki çalıştırmada tekrar dene
+                    changed = True
+                continue
+            time.sleep(1.5)
+            _cancel_all(symbol)
+            net = _realized_since(symbol, plan["opened_ms"] - 5000)
+            res = "sonuç okunamadı" if net is None else f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
+            days = (time.time() - plan["opened_ms"] / 1000) / 86400
+            yon = "LONG" if plan["side"] == "AL" else "SHORT"
+            r_txt = ""
+            if net is not None and plan.get("risk_usdt"):
+                r_txt = f" ({net / plan['risk_usdt']:+.2f}R)"
+            notify(f"🏁 {symbol}: trend bitti – {why}, {yon} kapatıldı ({days:.1f} gün) – {res}{r_txt}")
+            _record_close(symbol, plan, net, "İZ", notify)
+            del plans[symbol]
             changed = True
             continue
 
@@ -626,7 +693,8 @@ def open_trade(gate_symbol, alert, timeframe=None):
     symbol, mult = map_symbol(gate_symbol)
     tick, step, min_qty, max_qty, min_notional = _filters(symbol)
     sl = alert["stop"] * mult
-    tp = alert["target"] * mult
+    trend_mode = alert.get("exit_mode") == "trend"   # TP / yarı kâr / süre sınırı yok, iz süren çıkış
+    tp = None if trend_mode else alert["target"] * mult
 
     # 1) Açık pozisyon kontrolleri
     positions = _positions()
@@ -650,7 +718,10 @@ def open_trade(gate_symbol, alert, timeframe=None):
     if abs(mark - gate_entry) / gate_entry * 100 > MAX_PRICE_DIFF_PCT:
         return False, (f"⏭ {symbol}: fiyat sinyalden çok uzaklaşmış (sinyal {gate_entry:.6g}, "
                        f"şimdi {mark:.6g}), işlem açılmadı.")
-    if (side == "AL" and not (sl < mark < tp)) or (side == "SAT" and not (tp < mark < sl)):
+    if trend_mode:
+        if (side == "AL" and not sl < mark) or (side == "SAT" and not mark < sl):
+            return False, f"⏭ {symbol}: fiyat SL'nin ötesinde, işlem açılmadı."
+    elif (side == "AL" and not (sl < mark < tp)) or (side == "SAT" and not (tp < mark < sl)):
         return False, f"⏭ {symbol}: fiyat SL/TP aralığının dışında, işlem açılmadı."
 
     # 3) Büyüklük ve kaldıraç – piyasa emri en iyi alış/satış fiyatından dolacağı için onu kullan
@@ -693,7 +764,8 @@ def open_trade(gate_symbol, alert, timeframe=None):
     fill, filled_qty = _real_fill(symbol, order, qty, px)
 
     # 6) SL ve TP – SL konamazsa pozisyonu hemen kapat
-    sl_str, tp_str = _round_price(sl, tick), _round_price(tp, tick)
+    sl_str = _round_price(sl, tick)
+    tp_str = None if trend_mode else _round_price(tp, tick)
     try:
         sl_ref = _place_close_order(symbol, close_side, "STOP_MARKET", sl_str, pos_side)
     except Exception as e:
@@ -719,6 +791,10 @@ def open_trade(gate_symbol, alert, timeframe=None):
             trim_note = f"\n(giriş kayması nedeniyle {excess:g} adet hemen kapatıldı, SL zararı ~{target_loss:.0f} USDT'ye çekildi)"
         except Exception as e:
             trim_note = f"\n⚠️ Fazla miktar kapatılamadı ({e})"
+
+    if trend_mode:
+        return _finish_trend_trade(symbol, side, alert, timeframe, fill, filled_qty, sl_str, sl_ref,
+                                   pos_side, hedge, tick, step, leverage, trim_note)
 
     tp_note = ""
     try:
@@ -766,6 +842,41 @@ def open_trade(gate_symbol, alert, timeframe=None):
         f"🎯 TP: {tp_str} → kâr ≈ +{gain_at_tp:.0f} USDT\n"
         f"(komisyon hariç; giriş+çıkış ≈ {notional_real * 0.001:.0f} USDT)"
         + partial_note + _time_note(timeframe) + trim_note + tp_note
+    )
+    return True, msg
+
+
+def _finish_trend_trade(symbol, side, alert, timeframe, fill, filled_qty, sl_str, sl_ref,
+                        pos_side, hedge, tick, step, leverage, trim_note):
+    """Trend modu: planı kaydeder (TP/yarı kâr yok) ve açılış mesajını hazırlar."""
+    rule = alert.get("exit_rule") or "dc10"
+    plans = _load_plans()
+    plans[symbol] = {
+        "side": side, "entry": fill, "sl_str": sl_str, "tp_str": None, "mid": None,
+        "qty": filled_qty, "half": 0, "be_done": True, "sl_ref": list(sl_ref),
+        "pos_side": pos_side, "hedge": hedge, "tick": tick, "step": step,
+        "opened_ms": int(time.time() * 1000), "tf": timeframe,
+        "sl": float(sl_str), "risk_usdt": filled_qty * abs(fill - float(sl_str)),
+        "exit_mode": "trend", "exit_rule": rule,
+    }
+    _save_plans(plans)
+    tf = timeframe or "4h"
+    notional_real = filled_qty * fill
+    loss_at_sl = notional_real * abs(fill - float(sl_str)) / fill
+    if rule == "ema":
+        exit_txt = f"{tf} mumda EMA12/26 ters yönde kesişince"
+    else:
+        exit_txt = (f"{tf} mum önceki 10 mumun {'dibinin altında' if side == 'AL' else 'tepesinin üstünde'} "
+                    f"kapanınca")
+    msg = (
+        f"{'🟩 LONG' if side == 'AL' else '🟥 SHORT'} açıldı (trend) – {symbol}{' (DEMO)' if IS_DEMO else ''}\n"
+        f"Giriş: {fill:.{_decimals(tick)}f} | Miktar: {filled_qty:,.{_decimals(step)}f}\n"
+        f"Kaldıraç: {leverage}x ISOLATED | Teminat: ~{notional_real / leverage:.0f} USDT | "
+        f"Pozisyon: {notional_real:,.0f} USDT\n"
+        f"🛑 SL: {sl_str} ({alert.get('risk_atr', 0):.1f} ATR) → zarar ≈ -{loss_at_sl:.0f} USDT\n"
+        f"🎯 TP yok – iz süren çıkış: {exit_txt}\n"
+        f"(yarı kâr ve süre sınırı yok; komisyon hariç, giriş+çıkış ≈ {notional_real * 0.001:.0f} USDT)"
+        + trim_note
     )
     return True, msg
 
