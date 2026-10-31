@@ -1,21 +1,20 @@
 """
 Binance USDⓈ-M Futures otomatik işlem modülü (varsayılan: DEMO hesap).
 
-Sinyal botu bir sinyal bulduğunda `open_trade(...)` çağrılır:
-  1. Aynı coinde açık pozisyon varsa ya da açık pozisyon sayısı sınırdaysa işlem açılmaz.
-  2. Pozisyon büyüklüğü: MARGIN_USDT teminat, SL'ye gelirse teminatın LOSS_PCT_OF_MARGIN'i kadar zarar.
-       notional = (MARGIN × LOSS_PCT) / (|giriş − SL| / giriş)
-       kaldıraç = yukarı yuvarla(notional / MARGIN)  (coinin izin verdiği maksimumla sınırlı)
-  3. ISOLATED marjin, piyasa emriyle giriş.
-  4. SL (STOP_MARKET) ve TP (TAKE_PROFIT_MARKET) "pozisyonun tamamını kapat" emirleri.
-     SL konamazsa pozisyon güvenlik için hemen piyasa emriyle kapatılır.
-  Trend modlarında (alert["exit_mode"] == "trend"): sadece SL konur; TP, yarı kâr, süre sınırı ve
-  yapı çıkışı yoktur. Her yeni mum kapanışında iz süren çıkış kuralı (signal_bot.trend_exit)
-  kontrol edilir; oluşursa pozisyon piyasa fiyatından kapatılır (çıkış türü "İZ").
+Stratejiden bağımsızdır: giriş, stop ve çıkış ayarları sinyalle birlikte strateji dosyasından
+(strateji_<kod>.py → CIKIS) gelir. Bu dosyada sadece risk ve hesap ayarları vardır.
 
-Ayarlar (ortam değişkenleri):
-  BINANCE_API_KEY, BINANCE_API_SECRET   – GitHub Secrets
-  BINANCE_BASE_URL                      – varsayılan demo: https://demo-fapi.binance.com
+Sinyal gelince `open_trade(...)`:
+  1. Aynı coinde pozisyon varsa ya da pozisyon / yön sınırı doluysa işlem açılmaz.
+  2. Büyüklük: SL'ye gelirse MARGIN_USDT × LOSS_PCT_OF_MARGIN kadar zarar (1R).
+       notional = 1R / (|giriş − SL| / giriş),  kaldıraç = yukarı yuvarla(notional / MARGIN_USDT)
+  3. ISOLATED marjin, piyasa emriyle giriş; SL her zaman borsada STOP_MARKET olarak durur.
+     SL konamazsa pozisyon güvenlik için hemen kapatılır.
+  4. Stratejide varsa: TP emri, yarı kâr emri (sonra SL girişe çekilir).
+Her çalıştırmada `manage_positions(...)`: yarı kâr → SL girişe, iz süren çıkış (stratejinin
+iz_cikis kuralı, her mum kapanışında), süre sınırı, kapanış bildirimi ve rapor kaydı.
+
+Ortam değişkenleri: BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_BASE_URL (varsayılan demo)
 """
 import datetime
 import hashlib
@@ -29,27 +28,21 @@ import urllib.parse
 import urllib.request
 
 # =========================================================================
-# AYARLAR
+# AYARLAR (risk ve hesap – stratejiye özel ayarlar strateji dosyasında)
 # =========================================================================
 BASE_URL = os.environ.get("BINANCE_BASE_URL", "https://demo-fapi.binance.com").strip().rstrip("/")
 API_KEY = os.environ.get("BINANCE_API_KEY", "").strip()
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "").strip()
 
 MARGIN_USDT = 1000.0          # her işlemde kullanılacak teminat
-LOSS_PCT_OF_MARGIN = 0.10     # SL'de teminatın %10'u kaybedilir (1000 $ → 100 $ = 1R). trend_4h demo testi için 0.30 → 0.10
-MAX_OPEN_POSITIONS = 4        # aynı anda en fazla kaç pozisyon
-MAX_SAME_DIRECTION = 2        # aynı yönde (LONG ya da SHORT) en fazla kaç pozisyon – coinler BTC ile birlikte hareket eder
+LOSS_PCT_OF_MARGIN = 0.10     # SL'de teminatın %10'u kaybedilir (1000 $ → 100 $ = 1R)
+MAX_OPEN_POSITIONS = 4        # aynı anda en fazla kaç pozisyon (tüm stratejiler toplamı)
+MAX_SAME_DIRECTION = 2        # aynı yönde en fazla kaç pozisyon – coinler BTC ile birlikte hareket eder
 MAX_LEVERAGE = 50             # coinin izni daha yüksek olsa bile bu sınırı aşma
 MAX_PRICE_DIFF_PCT = 1.0      # Gate sinyal fiyatı ile Binance fiyatı bundan fazla farklıysa işlem açma
 TRIM_TOLERANCE = 0.02         # gerçek SL zararı hedefi %2'den fazla aşarsa fazlası kapatılır
-PARTIAL_AT = 0.5              # giriş→TP mesafesinin bu oranında (yarısında) kısmi kâr alınır
-PARTIAL_SIZE = 0.5            # kısmi kârda pozisyonun ne kadarı kapanır (%50)
-
-# Zaman sınırı: yarı kâra bu kadar mumda ulaşamayan pozisyon piyasa fiyatından kapatılır
-MAX_HOLD_CANDLES = {"15m": 16, "1h": 24}   # 15m: 4 saat, 1h: 24 saat
-DEFAULT_HOLD_CANDLES = 24                  # listede olmayan zaman dilimleri için
-AFTER_PARTIAL_MULT = 2                     # yarı kâr alındıysa kalan yarıya süre × 2 (0 = süre sınırı yok)
-STRUCTURE_EXIT = True                      # yapı bozulursa kapat: işlemin zaman diliminde mum EMA26'nın ters tarafında kapanırsa
+PARTIAL_SIZE = 0.5            # yarı kârda pozisyonun ne kadarı kapanır (strateji yari_kar tanımladıysa)
+AFTER_PARTIAL_MULT = 2        # yarı kârdan sonra süre sınırı × 2 (strateji sure_mum tanımladıysa)
 TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400,
               "8h": 28800, "1d": 86400}
 
@@ -345,15 +338,30 @@ def _last_close_price(symbol, start_ms, close_side):
         return None
 
 
+def _plan_cikis(plan):
+    """Planın çıkış ayarları. Eski sürümün planları (cikis alanı olmayan) için uyumlu karşılık."""
+    if plan.get("cikis"):
+        return plan["cikis"]
+    if plan.get("exit_mode") == "trend":                     # trend sürümü (strateji alanı yoktu)
+        return {"iz": True}
+    return {"sure_mum": {"15m": 16, "1h": 24}.get(plan.get("tf") or "1h", 24)}   # ilk sürüm (TP + yarı kâr)
+
+
+def _plan_strateji(plan):
+    if plan.get("strateji"):
+        return plan["strateji"]
+    return "trend_4h" if plan.get("exit_mode") == "trend" else "eski"
+
+
 def _record_close(symbol, plan, net, exit_type, notify):
-    """Kapanan işlemi rapor kaydına yazar; çıkış türünü (SL/TP/GİRİŞ/SÜRE/ELLE) belirler."""
+    """Kapanan işlemi rapor kaydına yazar; çıkış türü verilmediyse (SL/TP/GİRİŞ/ELLE) tahmin eder."""
     entry = plan["entry"]
     sl = plan.get("sl") or float(plan["sl_str"])
-    tp = float(plan["tp_str"]) if plan.get("tp_str") else None      # trend modunda TP yok
+    tp = float(plan["tp_str"]) if plan.get("tp_str") else None
     risk = plan.get("risk_usdt") or plan["qty"] * abs(entry - sl)
     partial = bool(plan.get("be_done") and plan.get("half", 0) > 0)
-    close_side = "SELL" if plan["side"] == "AL" else "BUY"
     if exit_type is None:
+        close_side = "SELL" if plan["side"] == "AL" else "BUY"
         px = _last_close_price(symbol, plan["opened_ms"] - 5000, close_side)
         tol = 0.15 * abs(entry - sl)
         if px is None:
@@ -371,7 +379,7 @@ def _record_close(symbol, plan, net, exit_type, notify):
         now = datetime.datetime.now(rapor.TZ)
         opened = datetime.datetime.fromtimestamp(plan["opened_ms"] / 1000, rapor.TZ)
         rapor.record({
-            "symbol": symbol, "side": plan["side"], "tf": plan.get("tf"),
+            "symbol": symbol, "side": plan["side"], "tf": plan.get("tf"), "strateji": _plan_strateji(plan),
             "opened": opened.isoformat(timespec="seconds"), "closed": now.isoformat(timespec="seconds"),
             "hours": round((now - opened).total_seconds() / 3600, 2),
             "entry": entry, "sl": sl, "tp": tp, "risk_usdt": round(risk, 2),
@@ -435,49 +443,16 @@ def _watch_untracked(rows, plans, notify):
     os.replace(tmp, WATCH_FILE)
 
 
-def _structure_broken(symbol, plan):
+def _iz_cikis_hit(symbol, plan):
     """
-    İşlemin zaman diliminde YENİ kapanan mum EMA26'nın ters tarafında mı kapandı?
-    LONG: kapanış < EMA26, SHORT: kapanış > EMA26 → açıklama metni. Değilse None.
-    Her mum için bir kez kontrol eder (plan["struct_checked"]).
-    """
-    import pandas as pd
-    import signal_bot as sb                      # indikatörler giriş kararındakiyle aynı hesaplanır
-    tf = plan.get("tf") or "1h"
-    sec = TF_SECONDS.get(tf, 3600)
-    last_open = int(time.time()) // sec * sec - sec           # son kapanmış mumun açılışı
-    if plan.get("struct_checked", 0) >= last_open:
-        return None
-    plan["struct_checked"] = last_open
-    if last_open + sec <= plan["opened_ms"] / 1000:          # mum, işlem açılmadan önce kapanmış
-        return None
-    rows = _request("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": tf, "limit": 200}, signed=False)
-    df = pd.DataFrame([[int(r[0]) // 1000, float(r[1]), float(r[2]), float(r[3]), float(r[4])] for r in rows],
-                      columns=["ts", "open", "high", "low", "close"])
-    if len(df) < 40:
-        return None
-    sb.compute_indicators(df)
-    hit = df.index[df["ts"] == last_open]
-    idx = int(hit[0]) if len(hit) else len(df) - 2
-    e26, close = float(df["ema_26"][idx]), float(df["close"][idx])
-    # Yapı bozuldu: mum EMA26'nın ters tarafında kapandı
-    if plan["side"] == "AL" and close < e26:
-        return f"{tf} mum EMA26'nın altında kapandı ({close:g} < {e26:.6g})"
-    if plan["side"] == "SAT" and close > e26:
-        return f"{tf} mum EMA26'nın üstünde kapandı ({close:g} > {e26:.6g})"
-    return None
-
-
-def _trend_exit_hit(symbol, plan):
-    """
-    Trend modu: işlemin zaman diliminde YENİ kapanan mumda çıkış kuralı oluştu mu?
-    Kural signal_bot.trend_exit ile aynı (ema: ters kesişim, dc10: 10 mumluk kanal dışında kapanış).
+    İz süren çıkış: işlemin zaman diliminde YENİ kapanan mumda stratejinin iz_cikis() kuralı oluştu mu?
     Her mum için bir kez kontrol eder (plan["exit_checked"]). Dönüş: açıklama metni ya da None.
     """
     import pandas as pd
-    import signal_bot as sb
-    tf = plan.get("tf") or "4h"
-    sec = TF_SECONDS.get(tf, 14400)
+    import signal_bot as sb                     # indikatörler ve strateji kuralı girişteki ile aynı
+    strat = sb.load_strategy(_plan_strateji(plan))
+    tf = plan.get("tf") or strat.ZAMAN_DILIMI
+    sec = TF_SECONDS.get(tf, 3600)
     last_open = int(time.time()) // sec * sec - sec           # son kapanmış mumun açılışı
     if plan.get("exit_checked", 0) >= last_open:
         return None
@@ -489,17 +464,43 @@ def _trend_exit_hit(symbol, plan):
                       columns=["ts", "open", "high", "low", "close"])
     hit = df.index[df["ts"] == last_open]
     if len(df) < 40 or not len(hit):
-        return None                                           # mum henüz gelmedi: sonraki çalıştırmada tekrar dene
+        return None                                           # mum henüz gelmedi: sonraki çalıştırmada tekrar
     plan["exit_checked"] = last_open
     sb.compute_indicators(df)
-    return sb.trend_exit(df, int(hit[0]), plan["side"], plan.get("exit_rule") or "dc10")
+    strat.hazirla(df)
+    return strat.iz_cikis(df, int(hit[0]), plan["side"])
+
+
+def _close_now(symbol, plan, amt, close_side, notify, exit_type, text):
+    """Pozisyonu piyasa fiyatından kapatır, bildirir ve kaydeder. Dönüş: kapandı mı."""
+    amt_str = f"{amt:.{_decimals(plan['step'])}f}"
+    try:
+        _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
+    except Exception as e:
+        if not plan.get("close_error"):
+            notify(f"❌ {symbol}: {exit_type} çıkışı gerekiyordu ama pozisyon kapatılamadı – ELLE KONTROL ET! ({e})")
+            plan["close_error"] = True
+        return False
+    time.sleep(1.5)
+    _cancel_all(symbol)
+    net = _realized_since(symbol, plan["opened_ms"] - 5000)
+    res = "sonuç okunamadı" if net is None else f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
+    if net is not None and plan.get("risk_usdt"):
+        res += f" ({net / plan['risk_usdt']:+.2f}R)"
+    hours = (time.time() - plan["opened_ms"] / 1000) / 3600
+    sure = f"{hours / 24:.1f} gün" if hours >= 48 else f"{hours:.1f} saat"
+    yon = "LONG" if plan["side"] == "AL" else "SHORT"
+    notify(f"{text}, {yon} kapatıldı ({sure}) – {res}")
+    _record_close(symbol, plan, net, exit_type, notify)
+    return True
 
 
 def manage_positions(notify):
     """
     Her çalıştırmada (dakikada bir) çağrılır:
-      - Yarı kâr emri gerçekleştiyse eski SL'yi iptal edip SL'yi giriş fiyatına çeker.
-      - Pozisyon tamamen kapandıysa sonucu Telegram'a bildirir ve planı siler.
+      - Pozisyon kapandıysa sonucu bildirir, rapora yazar, planı siler.
+      - Yarı kâr gerçekleştiyse SL'yi girişe çeker.
+      - İz süren çıkış (strateji iz_cikis) ve süre sınırı.
     """
     if not API_KEY:
         return
@@ -510,191 +511,97 @@ def manage_positions(notify):
         print(f"  pozisyon yönetimi: pozisyonlar okunamadı ({e})")
         return
     amounts = {p["symbol"]: abs(float(p["positionAmt"])) for p in rows}
-
     _watch_untracked(rows, plans, notify)
 
     changed = False
     for symbol, plan in list(plans.items()):
         amt = amounts.get(symbol, 0.0)
         close_side = "SELL" if plan["side"] == "AL" else "BUY"
+        cikis = _plan_cikis(plan)
 
-        # Pozisyon tamamen kapanmış
+        # 1) Pozisyon tamamen kapanmış (SL / TP borsada tetiklendi ya da elle kapatıldı)
         if amt == 0:
             net = _realized_since(symbol, plan["opened_ms"] - 5000)
             _cancel_all(symbol)
-            if net is None:
-                res = "sonuç okunamadı – Binance'te Trade History'ye bak"
-            else:
-                res = f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
+            res = ("sonuç okunamadı – Binance'te Trade History'ye bak" if net is None
+                   else f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)")
             exit_type = _record_close(symbol, plan, net, None, notify)
-            icon = "✅" if (net or 0) > 0 else "🔻"
-            notify(f"{icon} {symbol} pozisyonu kapandı ({exit_type}) – {res}")
+            notify(f"{'✅' if (net or 0) > 0 else '🔻'} {symbol} pozisyonu kapandı ({exit_type}) – {res}")
             del plans[symbol]
             changed = True
             continue
 
-        # Yarı kâr gerçekleşti mi? (kalan miktar, ilk miktardan yarı kadar azalmışsa)
+        # 2) Yarı kâr gerçekleşti mi? (kalan miktar ilk miktardan yarı kadar azaldıysa) → SL girişe
         if not plan["be_done"] and plan.get("half", 0) > 0 and amt <= plan["qty"] - 0.9 * plan["half"]:
-            tick = plan["tick"]
-            entry = plan["entry"]
-            # Giriş fiyatı, kâr tarafına yuvarlanır (LONG: yukarı, SHORT: aşağı)
+            tick, entry = plan["tick"], plan["entry"]
             be = (math.ceil(entry / tick) if plan["side"] == "AL" else math.floor(entry / tick)) * tick
             be_str = f"{be:.{_decimals(tick)}f}"
-            amt_str = f"{amt:.{_decimals(plan['step'])}f}"
             _cancel_order_ref(symbol, plan["sl_ref"])
             try:
-                plan["sl_ref"] = list(_place_close_order(symbol, close_side, "STOP_MARKET", be_str,
-                                                         plan["pos_side"]))
+                plan["sl_ref"] = list(_place_close_order(symbol, close_side, "STOP_MARKET", be_str, plan["pos_side"]))
                 profit = plan["half"] * abs(plan["mid"] - entry)
                 _log("partial", symbol, profit=round(profit, 2))
-                notify(f"🔸 {symbol}: hedefin yarısına gelindi – pozisyonun yarısı kapandı "
-                       f"(≈ +{profit:.0f} USDT).\nSL giriş fiyatına çekildi ({be_str}): kalan yarı artık risksiz. "
-                       f"TP {plan['tp_str']} bekleniyor.")
+                notify(f"🔸 {symbol}: yarı kâr alındı (≈ +{profit:.0f} USDT). SL giriş fiyatına çekildi ({be_str}), "
+                       f"kalan yarı artık risksiz." + (f" TP {plan['tp_str']} bekleniyor." if plan.get("tp_str") else ""))
             except Exception as e:
-                # SL girişe konamadıysa (ör. fiyat zaten girişin altına döndü) kalanı hemen kapat
-                try:
-                    _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
-                    notify(f"🔸 {symbol}: yarısı kârla kapandı; SL girişe konamadı ({e}), "
-                           f"kalan pozisyon piyasa fiyatından kapatıldı.")
+                try:      # SL girişe konamadıysa (fiyat zaten girişin ötesine döndü) kalanı kapat
+                    _market_close(symbol, close_side, f"{amt:.{_decimals(plan['step'])}f}",
+                                  plan["pos_side"], plan["hedge"])
+                    notify(f"🔸 {symbol}: yarısı kârla kapandı; SL girişe konamadı ({e}), kalan piyasa fiyatından kapatıldı.")
                 except Exception as e2:
-                    notify(f"❌ {symbol}: SL girişe konamadı ve kalan pozisyon kapatılamadı – ELLE KONTROL ET! ({e2})")
+                    notify(f"❌ {symbol}: SL girişe konamadı ve kalan kapatılamadı – ELLE KONTROL ET! ({e2})")
             plan["be_done"] = True
             changed = True
             continue
+        partial_taken = plan["be_done"] and plan.get("half", 0) > 0
 
-        # Trend modu: iz süren çıkış (yapı çıkışı ve süre sınırı uygulanmaz)
-        if plan.get("exit_mode") == "trend":
+        # 3) İz süren çıkış: stratejinin kuralı, her yeni mum kapanışında bir kez
+        if cikis.get("iz"):
             before = plan.get("exit_checked")
             try:
-                why = _trend_exit_hit(symbol, plan)
+                why = _iz_cikis_hit(symbol, plan)
             except Exception as e:
                 print(f"  {symbol}: iz süren çıkış kontrolü yapılamadı ({e})")
                 why = None
             if plan.get("exit_checked") != before:
                 changed = True
-            if not why:
-                continue
-            amt_str = f"{amt:.{_decimals(plan['step'])}f}"
-            try:
-                _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
-            except Exception as e:
-                if not plan.get("trail_close_error"):
-                    notify(f"❌ {symbol}: çıkış sinyali geldi ama pozisyon kapatılamadı – ELLE KONTROL ET! ({e})")
-                    plan["trail_close_error"] = True
-                    plan["exit_checked"] = before or 0          # sonraki çalıştırmada tekrar dene
-                    changed = True
-                continue
-            time.sleep(1.5)
-            _cancel_all(symbol)
-            net = _realized_since(symbol, plan["opened_ms"] - 5000)
-            res = "sonuç okunamadı" if net is None else f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
-            days = (time.time() - plan["opened_ms"] / 1000) / 86400
-            yon = "LONG" if plan["side"] == "AL" else "SHORT"
-            r_txt = ""
-            if net is not None and plan.get("risk_usdt"):
-                r_txt = f" ({net / plan['risk_usdt']:+.2f}R)"
-            notify(f"🏁 {symbol}: trend bitti – {why}, {yon} kapatıldı ({days:.1f} gün) – {res}{r_txt}")
-            _record_close(symbol, plan, net, "İZ", notify)
-            del plans[symbol]
-            changed = True
-            continue
-
-        # Yapı bozulması: sadece yarı kârı alınmamış işlemlerde
-        partial_taken = plan["be_done"] and plan.get("half", 0) > 0
-        if STRUCTURE_EXIT and not partial_taken:
-            before = plan.get("struct_checked")
-            try:
-                broken = _structure_broken(symbol, plan)
-            except Exception as e:
-                print(f"  {symbol}: yapı kontrolü yapılamadı ({e})")
-                broken = None
-            if plan.get("struct_checked") != before:
-                changed = True
-            if broken:
-                amt_str = f"{amt:.{_decimals(plan['step'])}f}"
-                try:
-                    _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
-                except Exception as e:
-                    notify(f"❌ {symbol}: yapı bozuldu ama pozisyon kapatılamadı – ELLE KONTROL ET! ({e})")
-                    continue
-                time.sleep(1.5)
-                _cancel_all(symbol)
-                net = _realized_since(symbol, plan["opened_ms"] - 5000)
-                res = "sonuç okunamadı" if net is None else f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
-                hours = (time.time() - plan["opened_ms"] / 1000) / 3600
-                tf_ = plan.get("tf") or "1h"
-                icon = "📉" if plan["side"] == "AL" else "📈"
-                yon = "LONG" if plan["side"] == "AL" else "SHORT"
-                notify(f"{icon} {symbol}: yapı bozuldu – {broken}, {yon} kapatıldı "
-                       f"({hours:.1f} saat) – {res}")
-                _record_close(symbol, plan, net, "YAPI", notify)
-                del plans[symbol]
+            if why:
+                if _close_now(symbol, plan, amt, close_side, notify, "İZ", f"🏁 {symbol}: çıkış sinyali – {why}"):
+                    del plans[symbol]
+                else:
+                    plan["exit_checked"] = before or 0             # sonraki çalıştırmada tekrar dene
                 changed = True
                 continue
 
-        # Zaman sınırı
-        tf = plan.get("tf") or "1h"
-        candles = MAX_HOLD_CANDLES.get(tf, DEFAULT_HOLD_CANDLES)
-        partial_taken = plan["be_done"] and plan.get("half", 0) > 0
-        if not candles or (partial_taken and not AFTER_PARTIAL_MULT):
-            continue
-        limit_s = candles * TF_SECONDS.get(tf, 3600) * (AFTER_PARTIAL_MULT if partial_taken else 1)
-        age_s = time.time() - plan["opened_ms"] / 1000
-        if age_s < limit_s:
-            continue
-        amt_str = f"{amt:.{_decimals(plan['step'])}f}"
-        try:
-            _market_close(symbol, close_side, amt_str, plan["pos_side"], plan["hedge"])
-        except Exception as e:
-            if not plan.get("time_close_error"):
-                notify(f"❌ {symbol}: süre doldu ama pozisyon kapatılamadı – ELLE KONTROL ET! ({e})")
-                plan["time_close_error"] = True
+        # 4) Süre sınırı
+        if cikis.get("sure_mum"):
+            tf = plan.get("tf") or "1h"
+            limit_s = cikis["sure_mum"] * TF_SECONDS.get(tf, 3600) * (AFTER_PARTIAL_MULT if partial_taken else 1)
+            if time.time() - plan["opened_ms"] / 1000 >= limit_s:
+                text = (f"⏰ {symbol}: kalan yarı süre sınırında TP'ye ulaşamadı" if partial_taken
+                        else f"⏰ {symbol}: {cikis['sure_mum']} mumda ({tf}) hedefe ulaşamadı")
+                if _close_now(symbol, plan, amt, close_side, notify, "SÜRE", text):
+                    del plans[symbol]
                 changed = True
-            continue
-        time.sleep(1.5)
-        _cancel_all(symbol)
-        net = _realized_since(symbol, plan["opened_ms"] - 5000)
-        res = "sonuç okunamadı" if net is None else f"net {'+' if net >= 0 else ''}{net:.0f} USDT (komisyon dahil)"
-        hours = age_s / 3600
-        if partial_taken:
-            notify(f"⏰ {symbol}: kalan yarı {hours:.1f} saatte TP'ye ulaşamadı, kapatıldı – {res}")
-        else:
-            notify(f"⏰ {symbol}: {candles} mumda ({tf}, {hours:.1f} saat) yarı kâra ulaşamadı, kapatıldı – {res}")
-        _record_close(symbol, plan, net, "SÜRE", notify)
-        del plans[symbol]
-        changed = True
 
     if changed:
         _save_plans(plans)
 
 
 # =========================================================================
-# Ana fonksiyon
+# İşlem açma
 # =========================================================================
-def _time_note(timeframe):
-    tf = timeframe or "1h"
-    candles = MAX_HOLD_CANDLES.get(tf, DEFAULT_HOLD_CANDLES)
-    if not candles:
-        return ""
-    h = candles * TF_SECONDS.get(tf, 3600) / 3600
-    after = f"yarı kâr alınırsa {h * AFTER_PARTIAL_MULT:g} saat" if AFTER_PARTIAL_MULT else "yarı kâr alınırsa süre sınırı yok"
-    note = f"\n⏰ Süre sınırı: {h:g} saat ({candles} mum), {after}"
-    if STRUCTURE_EXIT:
-        note += f"\n🧱 {tf} mum EMA26'nın ters tarafında kapanırsa (yarı kârdan önce) kapanır"
-    return note
-
-
 def open_trade(gate_symbol, alert, timeframe=None):
     """
-    alert: signal_bot.check_alert sonucu (side, entry, stop, target ...).
+    alert: signal_bot.check_alert sonucu (side, entry, stop, target, cikis, strateji ...).
     Dönüş: (açıldı_mı: bool, Telegram mesajı: str)
     """
     side = alert["side"]                        # "AL" -> LONG, "SAT" -> SHORT
+    cikis = alert.get("cikis") or {}
     symbol, mult = map_symbol(gate_symbol)
     tick, step, min_qty, max_qty, min_notional = _filters(symbol)
     sl = alert["stop"] * mult
-    trend_mode = alert.get("exit_mode") == "trend"   # TP / yarı kâr / süre sınırı yok, iz süren çıkış
-    tp = None if trend_mode else alert["target"] * mult
+    tp = alert["target"] * mult if alert.get("target") else None
 
     # 1) Açık pozisyon kontrolleri
     positions = _positions()
@@ -712,23 +619,20 @@ def open_trade(gate_symbol, alert, timeframe=None):
     if avail < MARGIN_USDT * 1.05:
         return False, f"⏭ {symbol}: kullanılabilir bakiye yetersiz ({avail:.0f} USDT)."
 
-    # 2) Güncel fiyat ve SL/TP kontrolü
+    # 2) Güncel fiyat kontrolü
     mark = float(_request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol}, signed=False)["markPrice"])
     gate_entry = alert["entry"] * mult
     if abs(mark - gate_entry) / gate_entry * 100 > MAX_PRICE_DIFF_PCT:
         return False, (f"⏭ {symbol}: fiyat sinyalden çok uzaklaşmış (sinyal {gate_entry:.6g}, "
                        f"şimdi {mark:.6g}), işlem açılmadı.")
-    if trend_mode:
-        if (side == "AL" and not sl < mark) or (side == "SAT" and not mark < sl):
-            return False, f"⏭ {symbol}: fiyat SL'nin ötesinde, işlem açılmadı."
-    elif (side == "AL" and not (sl < mark < tp)) or (side == "SAT" and not (tp < mark < sl)):
+    lo, hi = (sl, tp) if side == "AL" else (tp, sl)
+    if not ((lo is None or lo < mark) and (hi is None or mark < hi)):
         return False, f"⏭ {symbol}: fiyat SL/TP aralığının dışında, işlem açılmadı."
 
     # 3) Büyüklük ve kaldıraç – piyasa emri en iyi alış/satış fiyatından dolacağı için onu kullan
     px = _book_price(symbol, side) or mark
-    stop_frac = abs(px - sl) / px
     target_loss = MARGIN_USDT * LOSS_PCT_OF_MARGIN
-    notional = target_loss / stop_frac
+    notional = target_loss / (abs(px - sl) / px)
     leverage = max(1, math.ceil(notional / MARGIN_USDT))
     allowed = min(MAX_LEVERAGE, _max_leverage_for(symbol, notional))
     if leverage > allowed:
@@ -738,7 +642,6 @@ def open_trade(gate_symbol, alert, timeframe=None):
         if allowed2 < leverage:
             leverage = allowed2
             notional = MARGIN_USDT * leverage
-
     qty = float(_floor_qty(min(notional / px, max_qty), step))
     if qty < min_qty or qty * px < min_notional:
         return False, f"⏭ {symbol}: hesaplanan miktar çok küçük, işlem açılmadı."
@@ -750,22 +653,19 @@ def open_trade(gate_symbol, alert, timeframe=None):
         if e.code != -4046:                          # -4046: zaten ISOLATED
             raise
     _request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
-
     hedge = _hedge_mode()
-    open_side = "BUY" if side == "AL" else "SELL"
-    close_side = "SELL" if side == "AL" else "BUY"
+    open_side, close_side = ("BUY", "SELL") if side == "AL" else ("SELL", "BUY")
     pos_side = ("LONG" if side == "AL" else "SHORT") if hedge else "BOTH"
 
     # 5) Giriş
-    _cancel_all(symbol)                               # eski, artık emir kalmasın
+    _cancel_all(symbol)                               # eski emir kalmasın
     order = _request("POST", "/fapi/v1/order", {
         "symbol": symbol, "side": open_side, "type": "MARKET", "quantity": _floor_qty(qty, step),
         "positionSide": pos_side, "newOrderRespType": "RESULT"})
     fill, filled_qty = _real_fill(symbol, order, qty, px)
 
-    # 6) SL ve TP – SL konamazsa pozisyonu hemen kapat
+    # 6) SL – konamazsa pozisyonu hemen kapat
     sl_str = _round_price(sl, tick)
-    tp_str = None if trend_mode else _round_price(tp, tick)
     try:
         sl_ref = _place_close_order(symbol, close_side, "STOP_MARKET", sl_str, pos_side)
     except Exception as e:
@@ -777,110 +677,72 @@ def open_trade(gate_symbol, alert, timeframe=None):
         return False, f"❌ {symbol}: SL emri konamadı ({e}) – {note}."
 
     # 7) Gerçek dolum fiyatıyla SL zararı hedefi aşıyorsa fazla miktarı hemen kapat
-    trim_note = ""
-    max_qty_for_target = target_loss / abs(fill - float(sl_str))
-    excess = float(_floor_qty(filled_qty - max_qty_for_target, step))
+    notes = []
+    excess = float(_floor_qty(filled_qty - target_loss / abs(fill - float(sl_str)), step))
     if filled_qty * abs(fill - float(sl_str)) > target_loss * (1 + TRIM_TOLERANCE) and excess >= min_qty:
-        trim = {"symbol": symbol, "side": close_side, "type": "MARKET",
-                "quantity": _floor_qty(excess, step), "positionSide": pos_side}
-        if not hedge:
-            trim["reduceOnly"] = "true"
         try:
-            _request("POST", "/fapi/v1/order", trim)
+            _market_close(symbol, close_side, _floor_qty(excess, step), pos_side, hedge)
             filled_qty = float(_floor_qty(filled_qty - excess, step))
-            trim_note = f"\n(giriş kayması nedeniyle {excess:g} adet hemen kapatıldı, SL zararı ~{target_loss:.0f} USDT'ye çekildi)"
+            notes.append(f"(giriş kayması nedeniyle {excess:g} adet hemen kapatıldı, SL zararı ~{target_loss:.0f} USDT)")
         except Exception as e:
-            trim_note = f"\n⚠️ Fazla miktar kapatılamadı ({e})"
+            notes.append(f"⚠️ Fazla miktar kapatılamadı ({e})")
 
-    if trend_mode:
-        return _finish_trend_trade(symbol, side, alert, timeframe, fill, filled_qty, sl_str, sl_ref,
-                                   pos_side, hedge, tick, step, leverage, trim_note)
-
-    tp_note = ""
-    try:
-        _place_close_order(symbol, close_side, "TAKE_PROFIT_MARKET", tp_str, pos_side)
-    except Exception as e:
-        tp_note = f"\n⚠️ TP emri konamadı ({e}) – TP'yi elle koy."
-
-    # 8) Yarı kâr: hedeflenen hareketin yarısında pozisyonun %50'si kapanır
-    mid = fill + (float(tp_str) - fill) * PARTIAL_AT
-    mid_str = _round_price(mid, tick)
-    half = float(_floor_qty(filled_qty * PARTIAL_SIZE, step))
-    partial_note = ""
-    if half >= min_qty and filled_qty - half >= min_qty and half * float(mid_str) >= min_notional:
+    # 8) TP ve yarı kâr (strateji tanımladıysa)
+    tp_str, mid_str, half = None, None, 0.0
+    if tp is not None:
+        tp_str = _round_price(tp, tick)
         try:
-            _place_close_order(symbol, close_side, "TAKE_PROFIT_MARKET", mid_str, pos_side,
-                               qty=_floor_qty(half, step), hedge=hedge)
-            partial_note = (f"\n🔸 Yarı kâr: {mid_str} → {half:,.{_decimals(step)}f} adet (%{PARTIAL_SIZE * 100:.0f}) "
-                            f"kapanır ≈ +{half * abs(float(mid_str) - fill):.0f} USDT, SL girişe çekilir")
+            _place_close_order(symbol, close_side, "TAKE_PROFIT_MARKET", tp_str, pos_side)
         except Exception as e:
-            half = 0
-            partial_note = f"\n⚠️ Yarı kâr emri konamadı ({e}) – sadece SL/TP aktif."
-    else:
-        half = 0
-        partial_note = "\n(miktar çok küçük olduğu için yarı kâr emri konmadı)"
+            notes.append(f"⚠️ TP emri konamadı ({e}) – TP'yi elle koy.")
+        if cikis.get("yari_kar"):
+            mid_str = _round_price(fill + (float(tp_str) - fill) * cikis["yari_kar"], tick)
+            half = float(_floor_qty(filled_qty * PARTIAL_SIZE, step))
+            if half >= min_qty and filled_qty - half >= min_qty and half * float(mid_str) >= min_notional:
+                try:
+                    _place_close_order(symbol, close_side, "TAKE_PROFIT_MARKET", mid_str, pos_side,
+                                       qty=_floor_qty(half, step), hedge=hedge)
+                    notes.append(f"🔸 Yarı kâr: {mid_str} → %{PARTIAL_SIZE * 100:.0f} kapanır "
+                                 f"≈ +{half * abs(float(mid_str) - fill):.0f} USDT, SL girişe çekilir")
+                except Exception as e:
+                    half = 0.0
+                    notes.append(f"⚠️ Yarı kâr emri konamadı ({e})")
+            else:
+                half = 0.0
+                notes.append("(miktar çok küçük olduğu için yarı kâr emri konmadı)")
 
     plans = _load_plans()
     plans[symbol] = {
-        "side": side, "entry": fill, "sl_str": sl_str, "tp_str": tp_str, "mid": float(mid_str),
-        "qty": filled_qty, "half": half, "be_done": half == 0, "sl_ref": list(sl_ref),
-        "pos_side": pos_side, "hedge": hedge, "tick": tick, "step": step,
-        "opened_ms": int(time.time() * 1000), "tf": timeframe,
-        "sl": float(sl_str), "risk_usdt": filled_qty * abs(fill - float(sl_str)),
+        "side": side, "entry": fill, "sl_str": sl_str, "tp_str": tp_str,
+        "mid": float(mid_str) if mid_str else None, "qty": filled_qty, "half": half, "be_done": half == 0,
+        "sl_ref": list(sl_ref), "pos_side": pos_side, "hedge": hedge, "tick": tick, "step": step,
+        "opened_ms": int(time.time() * 1000), "tf": timeframe, "sl": float(sl_str),
+        "risk_usdt": filled_qty * abs(fill - float(sl_str)),
+        "strateji": alert.get("strateji"), "cikis": cikis,
     }
     _save_plans(plans)
 
     notional_real = filled_qty * fill
-    loss_at_sl = notional_real * abs(fill - float(sl_str)) / fill
-    gain_at_tp = notional_real * abs(float(tp_str) - fill) / fill
-    msg = (
-        f"{'🟩 LONG' if side == 'AL' else '🟥 SHORT'} açıldı – {symbol}{' (DEMO)' if IS_DEMO else ''}\n"
-        f"Giriş: {fill:.{_decimals(tick)}f} | Miktar: {filled_qty:,.{_decimals(step)}f}\n"
-        f"Kaldıraç: {leverage}x ISOLATED | Teminat: ~{notional_real / leverage:.0f} USDT | "
-        f"Pozisyon: {notional_real:,.0f} USDT\n"
-        f"🛑 SL: {sl_str} → zarar ≈ -{loss_at_sl:.0f} USDT\n"
-        f"🎯 TP: {tp_str} → kâr ≈ +{gain_at_tp:.0f} USDT\n"
-        f"(komisyon hariç; giriş+çıkış ≈ {notional_real * 0.001:.0f} USDT)"
-        + partial_note + _time_note(timeframe) + trim_note + tp_note
-    )
-    return True, msg
+    lines = [
+        f"{'🟩 LONG' if side == 'AL' else '🟥 SHORT'} açıldı – {symbol}{' (DEMO)' if IS_DEMO else ''}",
+        f"🏆 {alert.get('strateji_ad') or alert.get('strateji') or '-'}",
+        f"Giriş: {fill:.{_decimals(tick)}f} | Miktar: {filled_qty:,.{_decimals(step)}f}",
+        f"Kaldıraç: {leverage}x ISOLATED | Teminat: ~{notional_real / leverage:.0f} USDT | Pozisyon: {notional_real:,.0f} USDT",
+        f"🛑 SL: {sl_str} → zarar ≈ -{notional_real * abs(fill - float(sl_str)) / fill:.0f} USDT",
+        (f"🎯 TP: {tp_str} → kâr ≈ +{notional_real * abs(float(tp_str) - fill) / fill:.0f} USDT" if tp_str
+         else "🎯 TP yok"),
+    ]
+    if cikis.get("iz") and alert.get("cikis_metni"):
+        lines.append(f"🚪 Çıkış: {alert['cikis_metni']}")
+    if cikis.get("sure_mum"):
+        lines.append(f"⏰ Süre sınırı: {cikis['sure_mum']} mum ({timeframe})")
+    lines.append(f"(komisyon hariç; giriş+çıkış ≈ {notional_real * 0.001:.0f} USDT)")
+    return True, "\n".join(lines + notes)
 
 
-def _finish_trend_trade(symbol, side, alert, timeframe, fill, filled_qty, sl_str, sl_ref,
-                        pos_side, hedge, tick, step, leverage, trim_note):
-    """Trend modu: planı kaydeder (TP/yarı kâr yok) ve açılış mesajını hazırlar."""
-    rule = alert.get("exit_rule") or "dc10"
-    plans = _load_plans()
-    plans[symbol] = {
-        "side": side, "entry": fill, "sl_str": sl_str, "tp_str": None, "mid": None,
-        "qty": filled_qty, "half": 0, "be_done": True, "sl_ref": list(sl_ref),
-        "pos_side": pos_side, "hedge": hedge, "tick": tick, "step": step,
-        "opened_ms": int(time.time() * 1000), "tf": timeframe,
-        "sl": float(sl_str), "risk_usdt": filled_qty * abs(fill - float(sl_str)),
-        "exit_mode": "trend", "exit_rule": rule,
-    }
-    _save_plans(plans)
-    tf = timeframe or "4h"
-    notional_real = filled_qty * fill
-    loss_at_sl = notional_real * abs(fill - float(sl_str)) / fill
-    if rule == "ema":
-        exit_txt = f"{tf} mumda EMA12/26 ters yönde kesişince"
-    else:
-        exit_txt = (f"{tf} mum önceki 10 mumun {'dibinin altında' if side == 'AL' else 'tepesinin üstünde'} "
-                    f"kapanınca")
-    msg = (
-        f"{'🟩 LONG' if side == 'AL' else '🟥 SHORT'} açıldı (trend) – {symbol}{' (DEMO)' if IS_DEMO else ''}\n"
-        f"Giriş: {fill:.{_decimals(tick)}f} | Miktar: {filled_qty:,.{_decimals(step)}f}\n"
-        f"Kaldıraç: {leverage}x ISOLATED | Teminat: ~{notional_real / leverage:.0f} USDT | "
-        f"Pozisyon: {notional_real:,.0f} USDT\n"
-        f"🛑 SL: {sl_str} ({alert.get('risk_atr', 0):.1f} ATR) → zarar ≈ -{loss_at_sl:.0f} USDT\n"
-        f"🎯 TP yok – iz süren çıkış: {exit_txt}\n"
-        f"(yarı kâr ve süre sınırı yok; komisyon hariç, giriş+çıkış ≈ {notional_real * 0.001:.0f} USDT)"
-        + trim_note
-    )
-    return True, msg
-
-
+# =========================================================================
+# Rapor yardımcıları
+# =========================================================================
 def _income_between(start_ms, end_ms):
     out, cur = [], int(start_ms)
     for _ in range(20):
