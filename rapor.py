@@ -3,7 +3,8 @@
 
 - Her kapanan işlem `islemler.jsonl` dosyasına bir satır olarak yazılır (sunucuda /opt/sinyalbot).
 - Her gün 23:55'ten sonra günlük, her pazar 21:00'den sonra haftalık rapor Telegram'a gider.
-- Durma noktası (düşüş / kayıp serisi) aşılırsa bir kez uyarı gönderilir. Bot durdurulmaz, karar senin.
+- Durma noktası (düşüş / kayıp serisi) her strateji için ayrı izlenir; eşikler strateji dosyasındaki DURMA
+  listesinden gelir. Aşılırsa bir kez uyarı gönderilir. Bot durdurulmaz, karar senin.
 
 Elle rapor: sunucuda  sinyalbot-rapor
 """
@@ -19,27 +20,31 @@ STATUS_FILE = "rapor_durum.json"
 REPORT_WEEKDAY = 6            # 0 = pazartesi ... 6 = pazar
 REPORT_HOUR = 21              # bu saatten sonraki ilk çalıştırmada gönderilir
 MIN_RELIABLE_TRADES = 50      # bunun altında "sonuçlar henüz güvenilir değil" notu
-# trend_4h (1R = 100 USDT). Eşikler backtest'teki 378 işlemden Monte Carlo ile (%95): işlem sayısı arttıkça büyür.
-STRATEJI_BASLANGIC = "2026-10-31"   # bu tarihten önce AÇILAN işlemler (eski strateji) rapora ve uyarılara girmez
-STOP_STAGES = [                     # (en fazla işlem, düşüş sınırı USDT, kayıp serisi sınırı)
-    (30, 1240, 12),
-    (60, 1790, 14),
-    (None, 2250, 15),
-]
-STOP_DRAWDOWN_USDT = 2250     # son aşamadaki düşüş sınırı (STOP_STAGES'in son satırı)
-STOP_LOSING_STREAK = 15       # son aşamadaki kayıp serisi sınırı
+STRATEJI_BASLANGIC = "2026-10-31"   # bu tarihten önce AÇILAN işlemler (ilk sistem) rapora ve uyarılara girmez
+STOP_DRAWDOWN_USDT = 2250     # stratejide DURMA tanımlı değilse: zirveden bu kadar düşüş → uyarı
+STOP_LOSING_STREAK = 15       # stratejide DURMA tanımlı değilse: art arda bu kadar kayıp → uyarı
 
 
-def stop_limits(n):
-    """n kapanmış işlem için geçerli (düşüş, kayıp serisi) sınırı."""
-    for upto, dd, streak in STOP_STAGES:
+def _kod(t):
+    """İşlemin stratejisi (eski kayıtlarda alan yoksa zaman diliminden)."""
+    return t.get("strateji") or ("trend_4h" if t.get("tf") == "4h" else "eski")
+
+
+def stop_limits(n, kod):
+    """n kapanmış işlem için (düşüş, kayıp serisi) sınırı: strateji_<kod>.py → DURMA listesi."""
+    try:
+        import importlib
+        stages = importlib.import_module(f"strateji_{kod}").DURMA
+    except Exception:
+        return STOP_DRAWDOWN_USDT, STOP_LOSING_STREAK
+    for upto, dd, streak in stages:
         if upto is None or n <= upto:
             return dd, streak
-    return STOP_DRAWDOWN_USDT, STOP_LOSING_STREAK
+    return stages[-1][1], stages[-1][2]
 
 
-def load_strategy():
-    """Sadece şu anki stratejinin işlemleri (STRATEJI_BASLANGIC'tan sonra açılanlar)."""
+def load_current():
+    """Şu anki sistemin işlemleri (STRATEJI_BASLANGIC'tan sonra açılanlar)."""
     return [t for t in load() if t.get("opened", "") >= STRATEJI_BASLANGIC]
 
 
@@ -47,7 +52,7 @@ def load_strategy():
 # Kayıt
 # =========================================================================
 def record(trade):
-    """trade: dict (symbol, side, tf, opened, closed, hours, entry, sl, tp, risk_usdt, net, r, partial, exit)"""
+    """trade: dict (symbol, side, tf, strateji, opened, closed, hours, entry, sl, tp, risk_usdt, net, r, partial, exit)"""
     with open(JOURNAL_FILE, "a") as f:
         f.write(json.dumps(trade, ensure_ascii=False) + "\n")
 
@@ -156,7 +161,7 @@ def _line(label, s):
 def build_report(balance_line=None, now=None):
     now = now or datetime.datetime.now(TZ)
     week_start = (now - datetime.timedelta(days=7)).isoformat()
-    all_t = load_strategy()
+    all_t = load_current()
     week_t = [x for x in all_t if x.get("closed", "") >= week_start]
     s = stats(all_t)
     w = stats(week_t)
@@ -176,7 +181,7 @@ def build_report(balance_line=None, now=None):
         f"🗓 Son 7 gün: {w['n']} işlem | net {_usd(w.get('net', 0))} USDT | {_r(w.get('avg_r'))}/işlem"
         if w["n"] else "🗓 Son 7 gün: kapanan işlem yok",
         "",
-        f"📈 Strateji başından beri ({first}, {days} gün; eski işlemler hariç):",
+        f"📈 Toplam ({first}'den beri, {days} gün):",
         f"  İşlem: {s['n']} | Net: {_usd(s['net'])} USDT",
         f"  İşlem başına: {_r(s['avg_r'])} ({_usd(s['avg_net'])} USDT)",
         f"  Kazanan/kaybeden: {s['wins']}/{s['losses']} ({_pct(s['win_rate'])})",
@@ -190,8 +195,12 @@ def build_report(balance_line=None, now=None):
         "",
         "🔎 Döküm:",
     ]
-    for tf in sorted({x.get("tf") or "?" for x in all_t}):
-        lines.append(_line(tf, stats([x for x in all_t if (x.get("tf") or "?") == tf])))
+    for kod in sorted({_kod(x) for x in all_t}):
+        ks = stats([x for x in all_t if _kod(x) == kod])
+        lines.append(_line(kod, ks))
+        dd_lim, streak_lim = stop_limits(ks["n"], kod)
+        lines.append(f"     düşüş {_usd(-ks['max_dd'])} / sınır {_usd(-dd_lim)} · kayıp serisi {ks['max_streak']} / {streak_lim}"
+                     + (" 🛑" if ks["max_dd"] >= dd_lim or ks["max_streak"] >= streak_lim else ""))
     lines.append(_line("LONG", stats([x for x in all_t if x.get("side") == "AL"])))
     lines.append(_line("SHORT", stats([x for x in all_t if x.get("side") == "SAT"])))
 
@@ -199,10 +208,8 @@ def build_report(balance_line=None, now=None):
         lines += ["", balance_line]
     if s["n"] < MIN_RELIABLE_TRADES:
         lines += ["", f"ℹ️ {s['n']}/{MIN_RELIABLE_TRADES} işlem: sonuçlar henüz güvenilir değil, şans payı yüksek."]
-    dd_lim, streak_lim = stop_limits(s["n"])
-    lines.append(f"🛡 Durma sınırı ({s['n']} işlem): düşüş {_usd(-dd_lim)} USDT · art arda {streak_lim} kayıp")
-    if s["max_dd"] >= dd_lim or s["max_streak"] >= streak_lim:
-        lines += ["", "🛑 Durma noktası aşıldı (düşüş ya da kayıp serisi) – sonuçları birlikte değerlendirelim."]
+    if "🛑" in "\n".join(lines):
+        lines += ["", "🛑 Bir stratejide durma noktası aşıldı (düşüş ya da kayıp serisi) – sonuçları birlikte değerlendirelim."]
     return "\n".join(lines)
 
 
@@ -230,21 +237,23 @@ def maybe_send_weekly(notify, balance_fn=None, force=False):
 
 
 def check_stop_alerts(notify):
-    """Her kapanıştan sonra çağrılır; eşik ilk aşıldığında bir kez uyarır."""
-    s = stats(load_strategy())
-    if s["n"] == 0:
-        return
-    dd_lim, streak_lim = stop_limits(s["n"])
+    """Her kapanıştan sonra çağrılır; her strateji için eşik ilk aşıldığında bir kez uyarır."""
+    trades = load_current()
     st = _status()
-    k_dd, k_st = f"dd_alert_{STRATEJI_BASLANGIC}", f"streak_alert_{STRATEJI_BASLANGIC}"
-    if s["current_dd"] >= dd_lim and not st.get(k_dd):
-        notify(f"🛑 Durma noktası: strateji başından beri zirveden düşüş {_usd(-s['current_dd'])} USDT "
-               f"({s['n']} işlemde sınır {dd_lim}). Bot çalışmaya devam ediyor; sonuçlara birlikte bakalım.")
-        st[k_dd] = True
-    if s["current_streak"] >= streak_lim and not st.get(k_st):
-        notify(f"🛑 Durma noktası: art arda {s['current_streak']} kayıp ({s['n']} işlemde sınır {streak_lim}). "
-               f"Bot çalışmaya devam ediyor; sonuçlara birlikte bakalım.")
-        st[k_st] = True
+    for kod in sorted({_kod(t) for t in trades}):
+        s = stats([t for t in trades if _kod(t) == kod])
+        if s["n"] == 0:
+            continue
+        dd_lim, streak_lim = stop_limits(s["n"], kod)
+        k_dd, k_st = f"dd_alert_{kod}_{STRATEJI_BASLANGIC}", f"streak_alert_{kod}_{STRATEJI_BASLANGIC}"
+        if s["current_dd"] >= dd_lim and not st.get(k_dd):
+            notify(f"🛑 Durma noktası ({kod}): zirveden düşüş {_usd(-s['current_dd'])} USDT "
+                   f"({s['n']} işlemde sınır {dd_lim}). Bot çalışmaya devam ediyor; sonuçlara birlikte bakalım.")
+            st[k_dd] = True
+        if s["current_streak"] >= streak_lim and not st.get(k_st):
+            notify(f"🛑 Durma noktası ({kod}): art arda {s['current_streak']} kayıp ({s['n']} işlemde sınır {streak_lim}). "
+                   f"Bot çalışmaya devam ediyor; sonuçlara birlikte bakalım.")
+            st[k_st] = True
     _save_status(st)
 
 
@@ -366,10 +375,11 @@ def build_daily(day_start, day_end, bn=None):
     opened = [e for e in events if e["kind"] == "open"]
     skipped = [e for e in events if e["kind"] == "skip"]
     errors = [e for e in events if e["kind"] == "error"]
-    by_tf = {}
+    by_strat = {}
     for e in sig:
-        by_tf[e.get("tf", "?")] = by_tf.get(e.get("tf", "?"), 0) + 1
-    tf_txt = " · ".join(f"{k} {v}" for k, v in sorted(by_tf.items()))
+        k = e.get("strateji") or e.get("tf", "?")
+        by_strat[k] = by_strat.get(k, 0) + 1
+    tf_txt = " · ".join(f"{k} {v}" for k, v in sorted(by_strat.items()))
     lines.append(f"🆕 Sinyal: {len(sig)}" + (f" ({tf_txt})" if tf_txt else "") +
                  f" | Açılan: {len(opened)} | Atlanan: {len(skipped)}" + (f" | Hata: {len(errors)}" if errors else ""))
     if skipped:
