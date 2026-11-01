@@ -1,7 +1,7 @@
 """
-STRATEJİ: Sıkışma Kırılımı 15m  (kod: sikisma_15m)  — HENÜZ BACKTEST AŞAMASINDA, canlıda kullanma.
+STRATEJİ: Sıkışma Kırılımı 1h  (kod: sikisma_1h)  — HENÜZ BACKTEST AŞAMASINDA, canlıda kullanma.
 
-Fikir: fiyat 4 saat dar bir kutuda sıkışır; oynaklık genişlerken kutunun dışında güçlü bir mum kapanırsa
+Fikir: fiyat 16 saat dar bir kutuda sıkışır; oynaklık genişlerken kutunun dışında güçlü bir mum kapanırsa
 o yönde işlem açılır. Kurallar araştırma dokümanında önceden kayıtlıdır; testten önce değiştirilmez.
 
   Kutu     : sinyal mumundan ÖNCEKİ 16 mum. KH = en yüksek, KL = en düşük, W = KH − KL.
@@ -10,26 +10,28 @@ o yönde işlem açılır. Kurallar araştırma dokümanında önceden kayıtlı
              SHORT close ≤ KL − 0,1W ve (high − close)/(high − low) ≥ 0,6
              ortak: |close − open| ≥ 0,5 × mum boyu, 1,0 × ATR ≤ mum boyu ≤ 3,0 × ATR (ATR: önceki mum)
   Tek deneme: son 16 mumda sıkışma varken kutu dışında kapanış olduysa sinyal yok.
-  V1       : ek olarak 1h trendi (signal_bot.market_state) aynı yönde.
-  V2       : giriş KH / KL'ye limit emirle (retest) — bu kısım backtest'te ve ileride trader'da uygulanır.
-  Stop     : LONG KL − 0,1W, SHORT KH + 0,1W; risk %0,60–%3,0 dışındaysa sinyal yok.
-  Çıkış    : 3R hedef ya da 16 mum (4 saat) süre sınırı. Başa baş / iz süren / yarı kâr yok.
+  V1       : ek olarak 4h trendi (signal_bot.market_state) aynı yönde.
+  Stop     : LONG KL − 0,1W, SHORT KH + 0,1W; risk %1,2–%6,0 dışındaysa sinyal yok.
+  Çıkış    : 3R hedef ya da 16 mum (16 saat) süre sınırı. Başa baş / iz süren / yarı kâr yok.
+
+15m sürümü (istek 9) kaldı: yön bilgisi yoktu, maliyet ≈ 0,13R/işlem. 1h sürümü aynı kuralların
+daha geniş stoplu hali; risk alt sınırı maliyet ≤ ≈ 0,15R olacak şekilde %1,2. Bunun dışında kural aynı.
 
 Erişim kuralı (backtest uyumu): giris() ve stop() içinde sadece df["sütun"][i] ve
 df["sütun"][a:b].min()/.max() kullanılır. hazirla() gerçek DataFrame alır.
 """
 import math
 
-KOD = "sikisma_15m"
-AD = "Sıkışma Kırılımı 15m"
+KOD = "sikisma_1h"
+AD = "Sıkışma Kırılımı 1h"
 YON = "ikisi"
-ZAMAN_DILIMI = "15m"
-UST_ZAMAN_DILIMI = "1h"
+ZAMAN_DILIMI = "1h"
+UST_ZAMAN_DILIMI = "4h"
 COINLER = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT", "BNB_USDT",
            "DOGE_USDT", "ADA_USDT", "AVAX_USDT", "LINK_USDT", "SUI_USDT"]
-ACIKLAMA = ("15 dakikalık grafikte iki yönde çalışıyor; fiyat 4 saat dar bir kutuda sıkıştıktan sonra "
+ACIKLAMA = ("1 saatlik grafikte iki yönde çalışıyor; fiyat 16 saat dar bir kutuda sıkıştıktan sonra "
             "oynaklık genişlerken kutunun dışında güçlü bir mum kapanınca pozisyon açıyor. Fitille kırılımlara "
-            "ve aynı sıkışmadan ikinci denemeye girmiyor; 3R hedef ya da 4 saat sonra çıkıyor.")
+            "ve aynı sıkışmadan ikinci denemeye girmiyor; 3R hedef ya da 16 saat sonra çıkıyor.")
 
 CIKIS = {
     "stop_atr": None,         # stop, aşağıdaki stop() fonksiyonundan gelir (kutunun karşı ucu)
@@ -40,7 +42,7 @@ CIKIS = {
 }
 DURMA = [(None, 2250, 15)]    # backtest sonrası Monte Carlo ile güncellenecek
 
-VARYANT = "V0"                # "V0" | "V1" | "V2" — backtest her biri için ayrı çalıştırır
+VARYANT = "V0"                # "V0" | "V1" — backtest her biri için ayrı çalıştırır
 
 KUTU = 16                     # kutu uzunluğu (mum)
 PENCERE = 200                 # sıkışma karşılaştırma penceresi (mum)
@@ -50,7 +52,7 @@ GOVDE_ORAN = 0.5
 KAPANIS_YERI = 0.6
 ATR_MIN, ATR_MAX = 1.0, 3.0   # mum boyu / ATR
 STOP_PAYI = 0.1               # × W
-RISK_MIN, RISK_MAX = 0.006, 0.03
+RISK_MIN, RISK_MAX = 0.012, 0.06
 
 
 def hazirla(df):
@@ -94,14 +96,8 @@ def giris(df, i, ust_trend):
 
 
 def stop(df, i, side, entry, atr):
-    """Kutunun karşı ucu ± pay. Risk %0,60–%3,0 dışındaysa None (NO TRADE)."""
+    """Kutunun karşı ucu ± pay. Risk %1,2–%6,0 dışındaysa None (NO TRADE)."""
     kh, kl, w = float(df["kh"][i]), float(df["kl"][i]), float(df["w"][i])
     s = kl - STOP_PAYI * w if side == "AL" else kh + STOP_PAYI * w
     risk = abs(entry - s) / entry
     return s if RISK_MIN <= risk <= RISK_MAX else None
-
-
-def retest_seviyesi(df, i, side):
-    """V2 limit emir fiyatı ve iptal seviyesi (kutunun ortası)."""
-    kh, kl, w = float(df["kh"][i]), float(df["kl"][i]), float(df["w"][i])
-    return (kh if side == "AL" else kl), kl + 0.5 * w
