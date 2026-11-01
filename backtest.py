@@ -96,6 +96,8 @@ PLANLAR = {
         "sahte_kirilim_mum": 4,
     },
 }
+# sikisma_1h: istek 9 ile aynı düzen; 1h sinyal + 4h üst zaman dilimi, V2 yok
+PLANLAR["sikisma_1h"] = dict(PLANLAR["sikisma_15m"], varyantlar=["V0", "V1"])
 
 SEC = dict(sb.INTERVAL_SECONDS)
 _IMPORT = time.time()
@@ -1874,7 +1876,8 @@ def _v_yeni_is(istek, strat, dogr, notify):
         f"mumlar {'+'.join(zfs)}; her coin ilk {plan['isinma_mum']} mum ısınma",
         f"Geliştirme: {gel[0]} – {gel[-1]} ({len(gel)} ay) | Doğrulama: "
         + (f"{dog[0]} – {dog[-1]} (sadece seçilen varyant, bir kez)" if dogr else "KAPALI"),
-        "Maliyet: taker %0,05, maker %0,02 (V2 girişi), kayma BTC/ETH %0,02 · diğer %0,05, funding 8 saatte %0,01.",
+        "Maliyet: taker %0,05" + (", maker %0,02 (V2 girişi)" if "V2" in plan["varyantlar"] else "")
+        + ", kayma BTC/ETH %0,02 · diğer %0,05, funding 8 saatte %0,01.",
         f"Portföy: {bt.MAX_OPEN_POSITIONS} açık / yönde {bt.MAX_SAME_DIRECTION} / coinde 1 / günde {plan['gunluk_islem']} işlem "
         f"/ günlük {plan['gunluk_zarar_r']:g}R'de dur.",
     ]))
@@ -2015,11 +2018,14 @@ def _v_sinyal(d, b):
                 a1 = sb.check_alert(strat, pen, ust_t)
                 if not a1:
                     say("filtre (V1)")
-                seviye, orta = strat.retest_seviyesi(pen, 198, a0["side"])
+                seviye, orta = (strat.retest_seviyesi(pen, 198, a0["side"]) if "V2" in plan["varyantlar"]
+                                 else (None, None))
                 sig = {"T": T, "i": i, "tf": tf, "sym": bsym, "side": a0["side"], "entry": float(a0["entry"]),
                        "stop": float(a0["stop"]), "target": None if a0.get("target") is None else float(a0["target"]),
                        "src": "+".join(a0.get("sources") or [strat.KOD]), "v1": bool(a1),
-                       "seviye": float(seviye), "orta": float(orta), "atr": float(kol["atr"][i])}
+                       "seviye": None if seviye is None else float(seviye),
+                       "orta": None if orta is None else float(orta), "atr": float(kol["atr"][i]),
+                       "kh": float(kol["kh"][i]), "kl": float(kol["kl"][i])}
                 sig.update(_baglam(kol, i, a0["side"], sig["entry"], sig["stop"], ust_t, ust_g, None, None))
                 sig.update(gunluk_bilgi(T))
                 liste.append(sig)
@@ -2108,7 +2114,8 @@ def _v_simule(d, b):
              + tuple(BAGLAM)}
         # Sahte kırılım: sonraki 4 mumda kutu ortasının ötesine kapanış
         son_k = min(len(t), k0 + plan["sahte_kirilim_mum"])
-        x["sahte"] = bool(any(s * (C[k] - sig["orta"]) < 0 for k in range(k0, son_k)))
+        orta_k = sig["orta"] if sig.get("orta") is not None else (sig["kh"] + sig["kl"]) / 2
+        x["sahte"] = bool(any(s * (C[k] - orta_k) < 0 for k in range(k0, son_k)))
         # --- V0 / V1 / RASTGELE: sonraki mumun açılışında piyasa emri
         giris = float(O[k0])
         dist = abs(giris - sig["stop"])
@@ -2128,10 +2135,10 @@ def _v_simule(d, b):
                 r.update(_v_maliyet(plan, bsym, side, giris, px, dist, sig["T"], tc, False))
                 sonuc[yon_k] = r
             x["v0"], x["ters"] = sonuc["v0"], sonuc["ters"]
-        # --- V2: limit emir (retest)
+        # --- V2: limit emir (retest) – sadece planda V2 varsa
         lvl, orta = sig["seviye"], sig["orta"]
-        x["v2"] = {"atla": "retest dolmadı"}
-        for k in range(k0, min(len(t), k0 + plan["retest_mum"])):
+        x["v2"] = {"atla": "retest dolmadı"} if "V2" in plan["varyantlar"] else None
+        for k in (range(k0, min(len(t), k0 + plan["retest_mum"])) if "V2" in plan["varyantlar"] else ()):
             op, hi, lo, cl = float(O[k]), float(H[k]), float(L[k]), float(C[k])
             if (s == 1 and lo < lvl) or (s == -1 and hi > lvl):            # seviyenin ötesine geçti → doldu
                 fill = min(op, lvl) if s == 1 else max(op, lvl)
@@ -2209,6 +2216,7 @@ def _v_ist(tr, aylar):
     s["ort_kazanc"] = float(r[r > 0].mean()) if (r > 0).any() else None
     s["ort_kayip"] = float(r[r <= 0].mean()) if (r <= 0).any() else None
     s["ga"] = _k_blok_ga([{"T": x["T"], "r": x["r"]} for x in tr], aylar)
+    s["ga_brut"] = _k_blok_ga([{"T": x["T"], "r": x["r_brut"]} for x in tr], aylar)
     kap = sorted(tr, key=lambda x: x["cikis_t"])
     s["dd_r"] = _dd([x["r"] for x in kap])
     seri = en = 0
@@ -2239,9 +2247,10 @@ def _v_ozet(ad, s):
     if not s["n"]:
         return [f"{ad}: işlem yok"]
     ga = f"{_r(s['ga'][0])} … {_r(s['ga'][1])}" if s.get("ga") else "–"
+    gab = f"{_r(s['ga_brut'][0])} … {_r(s['ga_brut'][1])}" if s.get("ga_brut") else "–"
     return [
-        f"{ad}: {s['n']} işlem | {_r(s['ort_r'])}/işlem (maliyetsiz {_r(s['ort_brut'])}) | aylık blok %95 GA {ga} | "
-        f"PF {_f2(s['pf'])} (maliyetsiz {_f2(s['pf_brut'])}) | kazanma {_pct(s['kazanma'])}",
+        f"{ad}: {s['n']} işlem | {_r(s['ort_r'])}/işlem (maliyetsiz {_r(s['ort_brut'])}) | aylık blok %95 GA {ga} "
+        f"(maliyetsiz {gab}) | PF {_f2(s['pf'])} (maliyetsiz {_f2(s['pf_brut'])}) | kazanma {_pct(s['kazanma'])}",
         f"   net {_r(s['toplam_r'])} ({_usd(s['toplam_r'] * bt.MARGIN_USDT * bt.LOSS_PCT_OF_MARGIN)} USDT) | "
         f"en büyük düşüş {_f2(s['dd_r'])}R | en uzun kayıp serisi {s['seri']} | ort. kazanç {_r(s['ort_kazanc'])} · "
         f"ort. kayıp {_r(s['ort_kayip'])} | kârlı çeyrek {s['karli_ceyrek']}/{s['ceyrek_say']}",
@@ -2367,8 +2376,8 @@ def _v_rapor(d, b):
         "🔧 Strateji: " + _strateji_ozeti(strat),
         f"Doğrulama: {'AÇIK (sadece seçilen varyant)' if dogr_acik else 'KAPALI'} | Geliştirme {gel_aylar[0]} – "
         f"{gel_aylar[-1]} ({len(gel_aylar)} ay) | {len(d['islem_sembolleri'])} coin | 1R = {R_USDT:.0f} USDT",
-        "Maliyet dahil: taker %0,05/taraf, maker %0,02 (V2 girişi), kayma BTC/ETH %0,02 · diğer %0,05 (piyasa emri başına), "
-        "funding 00/08/16 UTC başına %0,01.",
+        "Maliyet dahil: taker %0,05/taraf" + (", maker %0,02 (V2 girişi)" if "V2" in plan["varyantlar"] else "")
+        + ", kayma BTC/ETH %0,02 · diğer %0,05 (piyasa emri başına), funding 00/08/16 UTC başına %0,01.",
         f"Portföy: {bt.MAX_OPEN_POSITIONS} açık / yönde {bt.MAX_SAME_DIRECTION} / coinde 1 / günde {plan['gunluk_islem']} işlem / "
         f"gün içi {plan['gunluk_zarar_r']:g}R'de yeni işlem yok.",
         "",
@@ -2378,7 +2387,7 @@ def _v_rapor(d, b):
         satir.append(f"{var}: " + ("✅ GEÇTİ" if sonuc[var]["gecti"] else "❌ KALDI"))
         satir += [f"  {'✅' if ok else '❌'} {ad}: {deger}" for ad, ok, deger in sonuc[var]["kural"]] or ["  işlem yok"]
     satir.append("➡️ " + (f"Seçilen: {secilen} (geçenler arasında ortalama R'si en yüksek). Doğrulama sadece bunun için bir kez açılır."
-                          if secilen else "Hiçbir varyant geçmedi. Plan gereği sonuca göre parametre ya da saat filtresi önerilmez."))
+                          if secilen else "Hiçbir varyant geçmedi. Plan gereği sonuca göre parametre, saat ya da coin filtresi önerilmez."))
 
     satir += ["", "2) SONUÇLAR – portföy sınırlarıyla"]
     for var in plan["varyantlar"]:
@@ -2494,11 +2503,15 @@ def _v_rapor(d, b):
         satir += ["", "7) DOĞRULAMA – hiçbir varyant geçmediği için açılmadı."]
 
     satir += ["", "Notlar:",
-              "- Çıkışlar 15m mumlarla işletildi; aynı mumda stop ve TP varsa önce stop; mum stopun ötesinde açıldıysa açılıştan çıkış.",
-              "- V2'de dolum mumunda sadece stop kontrol edildi (TP'nin dolumdan önce mi sonra mı geldiği bilinmiyor).",
+              f"- Çıkışlar {strat.ZAMAN_DILIMI} mumlarla işletildi; aynı mumda stop ve TP varsa önce stop; "
+              "mum stopun ötesinde açıldıysa açılıştan çıkış.",
+              "- 'maliyetsiz' = komisyon, kayma ve funding düşülmeden önceki sonuç; GA'lar aylık blok bootstrap (%95)."]
+    if "V2" in plan["varyantlar"]:
+        satir.append("- V2'de dolum mumunda sadece stop kontrol edildi (TP'nin dolumdan önce mi sonra mı geldiği bilinmiyor).")
+    satir += [
               "- Sahte kırılım: sinyalden sonraki 4 mumda kutu ortasının ötesine kapanış (işlemden bağımsız ölçülür).",
               "- t değeri: varyantın portföyde alınan her işlemi ile aynı sinyal mumundaki 200 RASTGELE sonucun ortalaması "
-              "arasındaki farklardan (eşleştirilmiş). V2 için RASTGELE, V0 girişiyle (sonraki mumun açılışı) hesaplanır.",
+              "arasındaki farklardan (eşleştirilmiş); RASTGELE V0 girişiyle (sonraki mumun açılışı) hesaplanır.",
               "- NO TRADE 'aday': stratejinin giris() kuralları sıkışma ve deneme şartları geçici olarak kaldırılarak "
               "uygulandığında kırılım veren mum.",
               f"- Süre: {(time.time() - d['baslangic']) / 60:.0f} dk."]
