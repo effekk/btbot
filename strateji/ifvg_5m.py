@@ -1,28 +1,36 @@
 """
-ifvg_5m (v1) — 5 dakikalık iFVG stratejisi, sadece günlük bias yönünde.
+ifvg_5m (v2) — 5 dakikalık iFVG stratejisi, sadece günlük bias yönünde.
 
 Bu dosya SADECE strateji kurallarını içerir. Emir dolumu, pozisyon takibi ve
 maliyet motordadır (motor/tek_islem.py). Canlı bot da bu dosyayı kullanır.
 
 Simetri: short tarafı, fiyatları ters çevrilmiş seride (o,h,l,c -> -o,-l,-h,-c)
-long kurallarının AYNISI çalıştırılarak elde edilir. Bu yüzden aşağıdaki
-yorumlar long (bullish bias) örneğine göre yazılmıştır; short tam simetriktir.
+long kurallarının AYNISI çalıştırılarak elde edilir. Aşağıdaki yorumlar long
+(bullish bias) örneğine göre yazılmıştır; short tam simetriktir.
 
 Long örneği (bearish FVG):
   m1.low > m3.high  -> bölge alt = m3.high, üst = m1.low
+  FVG genişliği (üst - alt) >= k * ATR(14, Wilder, m3 kapanışı) değilse hiç takip edilmez
   inversion  = m3'ten sonraki 48 mum içinde bölge üstünün üzerinde kapanan ilk mum
   Senaryo A  = inversion mumunun açılışı <= bölge altı, değilse Senaryo B
   stop       = bölge altı
+  Senaryo A tetik: bir mum (inversion mumu dahil) 3 FVG mumunun en yüksek high'ının üstünde kapanır
+  Senaryo B tetik (inversion mumu hariç, sonraki mumlardan itibaren), hangisi önce olursa:
+     (a) bir mum 3 FVG mumunun en yüksek high'ının üstünde kapanır
+     (b) inversion sonrası ilk kırmızı mum (close < open; doji sayılmaz) düzeltme mumudur;
+         sonraki bir mum onun high'ının üstünde kapanır
+  Giriş: tetik mumundan sonraki mumun açılışında piyasa emri.
+  Tetikten önce bölge altının altında kapanış -> kurulum iptal.
 
-Netleştirildi: ilk tetik kurulumu tüketir; giriş filtresi (bias, stop, 1,5R,
-günlük sınır, açık pozisyon) geçmezse kurulum düşer, sonraki mumlarda yeniden tetiklenmez.
+İlk tetik kurulumu tüketir; giriş filtresi (bias, stop, 1,5R, günlük sınır, açık
+pozisyon) geçmezse kurulum düşer, sonraki mumlarda yeniden tetiklenmez.
 """
 from bisect import bisect_left, bisect_right, insort
 
 import numpy as np
 
 AD = "ifvg_5m"
-SURUM = "v1"
+SURUM = "v2"
 
 MUM_MS = 5 * 60 * 1000
 GUN_MS = 24 * 60 * 60 * 1000
@@ -38,11 +46,11 @@ PARAM = {
     "swing_n": 2,               # 5m fraktal: iki yanında 2'şer mum
     "gunluk_swing_n": 2,        # günlük swing: iki yanında 2'şer gün
     "asya_bitis_saat": 8,       # 00:00-08:00 UTC seansı
-    # --- strateji sohbetinde netleştirilen yorumlar ---
-    "b_ayni_mum_geri_cekilme": True,   # geri çekilme ve kırılım kapanışı aynı mumda olabilir (iFVG'den red)
+    "atr_periyot": 14,          # ATR(14), Wilder
+    "fvg_min_atr_k": None,      # FVG genişliği >= k * ATR. k strateji sohbetinde belirlenecek (None = henüz yok)
 }
 
-VARYANTLAR = {"V1": "Senaryo A + B-piyasa", "V2": "Senaryo A + B-limit"}
+VARYANTLAR = {"V1": "Senaryo A + Senaryo B (v2)"}
 
 
 # ---------------------------------------------------------------------------
@@ -82,19 +90,32 @@ def gunluk_bias(gh, gl, gc, n=2):
     return bias, son_sh, son_sl, sh_piv, sl_piv
 
 
+def atr_wilder(H, L, C, n=14):
+    """ATR(n), Wilder: ilk değer ilk n TR'nin ortalaması, sonra (önceki*(n-1)+TR)/n.
+    atr[i] = i mumu kapanışındaki değer (i dahil). İlk n-1 mumda NaN."""
+    H, L, C = (np.asarray(x, dtype=float) for x in (H, L, C))
+    onceki = np.r_[np.nan, C[:-1]]
+    tr = np.fmax(H - L, np.fmax(np.abs(H - onceki), np.abs(L - onceki)))
+    tr[0] = H[0] - L[0]
+    atr = np.full(len(C), np.nan)
+    if len(C) >= n:
+        atr[n - 1] = tr[:n].mean()
+        for i in range(n, len(C)):
+            atr[i] = (atr[i - 1] * (n - 1) + tr[i]) / n
+    return atr
+
+
 # ---------------------------------------------------------------------------
 # Kurulum nesnesi (fiyatlar yön uzayında; gerçek fiyat = yon * değer)
 # ---------------------------------------------------------------------------
 class Kurulum:
     __slots__ = ("id", "yon", "tip", "senaryo", "m1", "m3", "k", "alt", "ust", "maks3",
-                 "maks_sonra", "geri_cekilme_mum", "tetik_mum", "kirilim", "limit_aktif",
-                 "hedef", "hedef_tip")
+                 "duzeltme_mum", "duzeltme_h", "tetik_mum", "tetik_turu", "hedef", "hedef_tip", "atr_orani")
 
     def __init__(self, **kw):
         for a in self.__slots__:
             setattr(self, a, kw.get(a))
 
-    # gerçek fiyatlar
     def fiyat(self, deger):
         return None if deger is None else self.yon * deger
 
@@ -108,30 +129,27 @@ class Kurulum:
 
 
 class _FVG:
-    __slots__ = ("m3", "alt", "ust", "maks3")
+    __slots__ = ("m3", "alt", "ust", "maks3", "atr_orani")
 
-    def __init__(self, m3, alt, ust, maks3):
-        self.m3, self.alt, self.ust, self.maks3 = m3, alt, ust, maks3
+    def __init__(self, m3, alt, ust, maks3, atr_orani):
+        self.m3, self.alt, self.ust, self.maks3, self.atr_orani = m3, alt, ust, maks3, atr_orani
 
 
 # ---------------------------------------------------------------------------
 # Tek yön takipçisi (long mantığı; short için ters seri)
 # ---------------------------------------------------------------------------
 class _TekYon:
-    def __init__(self, yon, T, O, H, L, C, varyant, p, sayac):
+    def __init__(self, yon, T, O, H, L, C, p, sayac):
         self.yon = yon
         self.s = 1.0 if yon > 0 else -1.0
         self.T, self._O, self._C = T, O, C
         self._H = H if yon > 0 else L     # yön uzayında high
         self._L = L if yon > 0 else H     # yön uzayında low
-        self.varyant = varyant
         self.p = p
         self.sayac = sayac                # ortak id sayacı (liste)
         self.fvgler = []
         self.kurulumlar = []
-        self.yeni_limitler = []
         self.lik = []                     # alınmamış kesinleşmiş swing high'lar (sıralı)
-        self.swingler = []                # (pivot mum, seviye) — kırılım seviyesi için
         self.gun_h = None
         self.ogh = None                   # önceki gün high
         self.ogh_alindi = False
@@ -168,23 +186,11 @@ class _TekYon:
         self.asya_bitti = False
         self.asya_alindi = False
 
-    def _kirilim(self, k, i):
-        """B-piyasa kırılım seviyesi: i mumundan önce kesinleşmiş, pivotu inversion'dan
-        sonra olan son swing high; yoksa inversion mumu dahil i'den önceki en yüksek high."""
-        n = self.p["swing_n"]
-        for q, sev in reversed(self.swingler):
-            if q <= k.k:
-                break
-            if q + n <= i - 1:
-                return sev, "swing"
-        return k.maks_sonra, "en_yuksek"
-
     # ---- ana adım --------------------------------------------------------
-    def mum_kapandi(self, i, dusen):
+    def mum_kapandi(self, i, atr, dusen):
         s, p = self.s, self.p
         o = s * self._O[i]
         h = s * self._H[i]
-        l = s * self._L[i]
         c = s * self._C[i]
         tetikler = []
 
@@ -206,53 +212,30 @@ class _TekYon:
                 self.asya_bitti = True
         self.gun_h = h if self.gun_h is None else max(self.gun_h, h)
 
-        # 2) 5m swing high kesinleşmesi (pivot = i - n)
+        # 2) 5m swing high kesinleşmesi (pivot = i - n) -> hedef adayı
         n = p["swing_n"]
         q = i - n
         if q - n >= 0:
             hq = self.h(q)
             if all(hq > self.h(q - j) and hq > self.h(q + j) for j in range(1, n + 1)):
                 insort(lik, hq)
-                self.swingler.append((q, hq))
-                if len(self.swingler) > 400:
-                    del self.swingler[:200]
 
-        # 3) mevcut kurulumlar
+        # 3) mevcut kurulumlar (inversion mumundan sonraki mumlar)
         omur = p["giris_omur"]
         kalan = []
         for k in self.kurulumlar:
-            if k.tip == "A":
-                if c > k.maks3:
-                    k.tetik_mum = i
-                    tetikler.append(k)
-                elif c < k.alt:
-                    dusen["iptal_bolge_alti"] += 1
-                elif i >= k.k + omur - 1:
-                    dusen["sure_doldu"] += 1
-                else:
-                    kalan.append(k)
-            elif k.tip == "B-piyasa":
-                if p["b_ayni_mum_geri_cekilme"] and k.geri_cekilme_mum is None and l <= k.ust:
-                    k.geri_cekilme_mum = i
-                sev, _ = self._kirilim(k, i)
-                if k.geri_cekilme_mum is not None and c > sev:
-                    k.tetik_mum = i
-                    k.kirilim = sev
-                    tetikler.append(k)
-                elif c < k.alt:
-                    dusen["iptal_bolge_alti"] += 1
-                else:
-                    if k.geri_cekilme_mum is None and l <= k.ust:
-                        k.geri_cekilme_mum = i
-                    k.maks_sonra = max(k.maks_sonra, h)
-                    if i >= k.k + omur - 1:
-                        dusen["sure_doldu"] += 1
-                    else:
-                        kalan.append(k)
-            else:  # B-limit (dolum motorda)
-                if c < k.alt:
-                    dusen["iptal_bolge_alti"] += 1
-                elif i >= k.k + omur:
+            if c > k.maks3:
+                k.tetik_mum, k.tetik_turu = i, "3mum"
+                tetikler.append(k)
+            elif k.tip == "B" and k.duzeltme_h is not None and c > k.duzeltme_h:
+                k.tetik_mum, k.tetik_turu = i, "duzeltme"
+                tetikler.append(k)
+            elif c < k.alt:
+                dusen["iptal_bolge_alti"] += 1
+            else:
+                if k.tip == "B" and k.duzeltme_mum is None and c < o:
+                    k.duzeltme_mum, k.duzeltme_h = i, h      # ilk ters renkli mum, bir kez
+                if i >= k.k + omur - 1:
                     dusen["sure_doldu"] += 1
                 else:
                     kalan.append(k)
@@ -264,30 +247,33 @@ class _TekYon:
             if c > f.ust:
                 self.sayac[0] += 1
                 senaryo = "A" if o <= f.alt else "B"
-                tip = "A" if senaryo == "A" else ("B-piyasa" if self.varyant == "V1" else "B-limit")
-                k = Kurulum(id=self.sayac[0], yon=self.yon, tip=tip, senaryo=senaryo,
+                k = Kurulum(id=self.sayac[0], yon=self.yon, tip=senaryo, senaryo=senaryo,
                             m1=f.m3 - 2, m3=f.m3, k=i, alt=f.alt, ust=f.ust, maks3=f.maks3,
-                            maks_sonra=h, limit_aktif=False)
+                            atr_orani=f.atr_orani)
                 dusen["kurulum_" + senaryo] += 1
-                if tip == "A" and c > k.maks3:
-                    k.tetik_mum = i
+                if senaryo == "A" and c > k.maks3:      # A: inversion mumu da tetik olabilir
+                    k.tetik_mum, k.tetik_turu = i, "3mum"
                     tetikler.append(k)
                 else:
                     self.kurulumlar.append(k)
-                    if tip == "B-limit":
-                        self.yeni_limitler.append(k)
             elif i - f.m3 >= p["fvg_omur"]:
                 dusen["fvg_inversionsuz_doldu"] += 1
             else:
                 kalan_f.append(f)
         self.fvgler = kalan_f
 
-        # 5) yeni FVG (m3 = i)
+        # 5) yeni FVG (m3 = i), ATR alt sınırı
         if i >= 2:
             l1 = self.l(i - 2)
             if l1 > h:
-                self.fvgler.append(_FVG(i, h, l1, max(self.h(i - 2), self.h(i - 1), h)))
-                dusen["fvg"] += 1
+                genislik = l1 - h
+                oran = genislik / atr if atr and atr > 0 else float("nan")
+                k_min = p["fvg_min_atr_k"]
+                if k_min is not None and not (oran >= k_min):
+                    dusen["fvg_atr_alti"] += 1
+                else:
+                    self.fvgler.append(_FVG(i, h, l1, max(self.h(i - 2), self.h(i - 1), h), oran))
+                    dusen["fvg"] += 1
         return tetikler
 
 
@@ -297,16 +283,17 @@ class _TekYon:
 class IfvgStrateji:
     """T: ms açılış zamanları, O/H/L/C: listeler. gun_bias: {gün_no: bias} (gün_no = ms // GUN_MS)."""
 
-    def __init__(self, T, O, H, L, C, gun_bias, varyant, param=None):
+    def __init__(self, T, O, H, L, C, gun_bias, varyant="V1", param=None):
         assert varyant in VARYANTLAR
         self.p = dict(PARAM, **(param or {}))
         self.T, self.O, self.H, self.L, self.C = T, O, H, L, C
         self.gun_bias = gun_bias
         self.varyant = varyant
         self.dusen = _Sayac()
+        self.atr = atr_wilder(H, L, C, self.p["atr_periyot"])
         sayac = [0]
-        self.yonler = {1: _TekYon(1, T, O, H, L, C, varyant, self.p, sayac),
-                       -1: _TekYon(-1, T, O, H, L, C, varyant, self.p, sayac)}
+        self.yonler = {1: _TekYon(1, T, O, H, L, C, self.p, sayac),
+                       -1: _TekYon(-1, T, O, H, L, C, self.p, sayac)}
         self.gun = None
         self.aktif_bias = None
 
@@ -318,7 +305,7 @@ class IfvgStrateji:
             ty.gun_bitti()
         yeni = int(self.gun_bias.get(yeni_gun, 0))
         if self.aktif_bias is not None and yeni != self.aktif_bias:
-            # bias değişti: bekleyen kurulumlar ve limitler iptal (bu mumda oluşanlar yeni güne ait)
+            # bias değişti: bekleyen kurulumlar iptal (bu mumda oluşanlar yeni güne aittir)
             for ty in self.yonler.values():
                 kalan = []
                 for k in ty.kurulumlar:
@@ -339,35 +326,13 @@ class IfvgStrateji:
             self.aktif_bias = self.bias(t)
         elif g != self.gun:          # veri boşluğu nedeniyle 23:55 mumu yoksa
             self._gun_degis(g, i)
-        tetikler = self.yonler[1].mum_kapandi(i, self.dusen) + self.yonler[-1].mum_kapandi(i, self.dusen)
+        atr = self.atr[i]
+        atr = None if atr != atr else float(atr)
+        tetikler = (self.yonler[1].mum_kapandi(i, atr, self.dusen)
+                    + self.yonler[-1].mum_kapandi(i, atr, self.dusen))
         if (t + MUM_MS) % GUN_MS == 0:
-            self._gun_degis(g + 1, i)       # bu mumda (i) oluşan kurulumlar yeni güne aittir, korunur
-        # B-limit yerleştirme kontrolleri (emir i+1'den itibaren geçerli)
-        for ty in self.yonler.values():
-            for k in ty.yeni_limitler:
-                if k not in ty.kurulumlar:
-                    continue
-                sebep = self._limit_kontrol(ty, k, t + MUM_MS)
-                if sebep:
-                    ty.kurulumlar.remove(k)
-                    self.dusen[sebep] += 1
-                else:
-                    k.limit_aktif = True
-            ty.yeni_limitler = []
+            self._gun_degis(g + 1, i)
         return tetikler
-
-    def _limit_kontrol(self, ty, k, emir_zamani):
-        if self.bias(emir_zamani) != k.yon:
-            return "bias_uyumsuz"
-        giris, stop = k.ust, k.alt
-        d = giris - stop
-        if d / abs(giris) < self.p["min_stop_orani"]:
-            return "stop_dar"
-        hb = ty.hedef_bul(giris)
-        if hb is None or hb[0] - giris < self.p["min_rr"] * d:
-            return "hedef_1_5R_alti"
-        k.hedef, k.hedef_tip = hb
-        return None
 
     def giris_degerlendir(self, k, giris_fiyati, zaman_ms):
         """Piyasa girişi (kaymasız açılış fiyatı). Dönüş: (None, bilgi) ya da (sebep, None)."""
@@ -386,22 +351,6 @@ class IfvgStrateji:
             return "hedef_1_5R_alti", None
         k.hedef, k.hedef_tip = hb
         return None, {"giris": giris_fiyati, "stop": k.yon * stop, "hedef": k.yon * hb[0], "hedef_tip": hb[1]}
-
-    def limit_dolumlari(self, i):
-        """i mumunda dolan aktif limitler, dolum sırasına göre (long: yüksek limit önce)."""
-        dolan = []
-        for yon, ty in self.yonler.items():
-            l = ty.l(i)
-            for k in ty.kurulumlar:
-                if k.tip == "B-limit" and k.limit_aktif and l < k.ust:
-                    dolan.append(k)
-        dolan.sort(key=lambda k: -k.ust)
-        return dolan
-
-    def kurulum_kaldir(self, k):
-        ty = self.yonler[k.yon]
-        if k in ty.kurulumlar:
-            ty.kurulumlar.remove(k)
 
 
 class _Sayac(dict):
