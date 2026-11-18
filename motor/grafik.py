@@ -23,11 +23,13 @@ def _zaman(ms, gun=False):
     return s[:10] if gun else s[5:16].replace("T", " ")
 
 
-def kurulum_grafigi(dosya, V, G, x, bias_bilgi):
-    """V: 5m numpy dict, G: günlük numpy dict (+ 'sh_piv','sl_piv','bias','son_sh','son_sl')."""
+def kurulum_grafigi(dosya, V, G, x, sonuc_goster=False):
+    """V: 5m numpy dict, G: günlük numpy dict (+ 'sh_piv','sl_piv','bias','son_sh','son_sl').
+    sonuc_goster=False: grafik giriş mumunda biter, çıkış gösterilmez (stop/hedef çizgileri kalır)."""
     t, O, H, L, C = V["t"], V["o"], V["h"], V["l"], V["c"]
     a = max(0, x["m1"] - 20)
-    b = min(len(C) - 1, x["x"] + 8)
+    b = min(len(C) - 1, x["x"] + 8) if sonuc_goster else x["e"]
+    son = x["x"] if sonuc_goster else x["e"] + 6     # stop/hedef çizgilerinin bittiği yer
     sl = slice(a, b + 1)
     xs = np.arange(a, b + 1)
     fig = plt.figure(figsize=(16, 7.5), dpi=110)
@@ -48,47 +50,45 @@ def kurulum_grafigi(dosya, V, G, x, bias_bilgi):
     ax.annotate("inversion", (k, yk), xytext=(k, yk + (1 if yon > 0 else -1) * (H[sl].max() - L[sl].min()) * 0.06),
                 ha="center", fontsize=8, color="purple",
                 arrowprops=dict(arrowstyle="->", color="purple"))
-    if x["senaryo"] == "A":
-        ax.hlines(x["maks3"], x["m1"], x["tetik"] + 0.5, colors="purple", linestyles=":", lw=1.2)
-        ax.text(x["m1"], x["maks3"], " A tetik seviyesi (3 mumun en uç değeri)", fontsize=7, color="purple",
-                va="bottom" if yon > 0 else "top")
-        ax.plot([x["tetik"]], [C[x["tetik"]]], marker="s", ms=6, mfc="none", mec="purple")
-    if x["tip"] == "B-piyasa":
-        g = x["geri_cekilme"]
-        ax.plot([g], [L[g] if yon > 0 else H[g]], marker="o", ms=7, mfc="none", mec="blue")
-        ax.text(g, L[g] if yon > 0 else H[g], " geri çekilme", fontsize=7, color="blue",
-                va="top" if yon > 0 else "bottom")
-        ax.hlines(x["kirilim"], k, x["tetik"] + 0.5, colors="blue", linestyles=":", lw=1.2)
-        ax.text(k, x["kirilim"], " kırılım seviyesi", fontsize=7, color="blue", va="bottom")
-        ax.plot([x["tetik"]], [C[x["tetik"]]], marker="s", ms=6, mfc="none", mec="blue")
-    if x["tip"] == "B-limit":
-        ax.hlines(x["giris"], k + 0.5, x["e"], colors="teal", linestyles="--", lw=1.2)
-        ax.text(k + 0.5, x["giris"], " limit (bölge kenarı)", fontsize=7, color="teal", va="bottom")
+    ax.hlines(x["maks3"], x["m1"], x["tetik"] + 0.5, colors="purple", linestyles=":", lw=1.2)
+    ax.text(x["m1"], x["maks3"], " 3 FVG mumunun en uç değeri", fontsize=7, color="purple",
+            va="bottom" if yon > 0 else "top")
+    if x.get("duzeltme") is not None:
+        g = x["duzeltme"]
+        ax.plot([g], [x["duzeltme_h"]], marker="o", ms=7, mfc="none", mec="blue")
+        ax.hlines(x["duzeltme_h"], g, x["tetik"] + 0.5, colors="blue", linestyles=":", lw=1.2)
+        ax.annotate("düzeltme mumu", (g, x["duzeltme_h"]), xytext=(-6, 12 if yon > 0 else -14),
+                    textcoords="offset points", ha="right", fontsize=7, color="blue")
+    renk = "blue" if x.get("tetik_turu") == "duzeltme" else "purple"
+    ax.plot([x["tetik"]], [C[x["tetik"]]], marker="s", ms=7, mfc="none", mec=renk)
+    ax.annotate(f"tetik ({x.get('tetik_turu')})", (x["tetik"], C[x["tetik"]]), xytext=(0, -16 if yon > 0 else 12),
+                textcoords="offset points", ha="center", fontsize=7, color=renk)
     # giriş, stop, hedef, çıkış
     ax.plot([x["e"]], [x["giris"]], marker="^" if yon > 0 else "v", ms=11, color="black", zorder=5)
-    ax.hlines(x["stop"], x["e"] - 0.5, x["x"] + 0.5, colors=KIRMIZI, lw=1.6)
-    ax.hlines(x["hedef"], x["e"] - 0.5, x["x"] + 0.5, colors=YESIL, lw=1.6)
-    ax.hlines(x["giris"], x["e"] - 0.5, x["x"] + 0.5, colors="black", lw=0.8, linestyles="--")
-    ax.text(x["x"] + 0.7, x["stop"], f"stop {x['stop']:.2f}", fontsize=8, color=KIRMIZI, va="center")
-    ax.text(x["x"] + 0.7, x["hedef"], f"hedef {x['hedef']:.2f} ({x['hedef_tip']})", fontsize=8, color=YESIL, va="center")
-    ax.text(x["x"] + 0.7, x["giris"], f"giriş {x['giris']:.2f}", fontsize=8, va="center")
-    ax.plot([x["x"]], [x["cikis"]], marker="X", ms=10, color="dimgray", zorder=6)
-    ax.annotate(f"çıkış: {x['cikis_tipi']}", (x["x"], x["cikis"]), xytext=(0, -16 if yon > 0 else 16),
-                textcoords="offset points", ha="center", fontsize=8, color="dimgray")
+    ax.hlines(x["stop"], x["e"] - 0.5, son + 0.5, colors=KIRMIZI, lw=1.6)
+    ax.hlines(x["hedef"], x["e"] - 0.5, son + 0.5, colors=YESIL, lw=1.6)
+    ax.hlines(x["giris"], x["e"] - 0.5, son + 0.5, colors="black", lw=0.8, linestyles="--")
+    ax.text(son + 0.7, x["stop"], f"stop {x['stop']:.2f}", fontsize=8, color=KIRMIZI, va="center")
+    ax.text(son + 0.7, x["hedef"], f"hedef {x['hedef']:.2f} ({x['hedef_tip']})", fontsize=8, color=YESIL, va="center")
+    ax.text(son + 0.7, x["giris"], f"giriş {x['giris']:.2f}", fontsize=8, va="center")
+    if sonuc_goster:
+        ax.plot([x["x"]], [x["cikis"]], marker="X", ms=10, color="dimgray", zorder=6)
+        ax.annotate(f"çıkış: {x['cikis_tipi']}", (x["x"], x["cikis"]), xytext=(0, -16 if yon > 0 else 16),
+                    textcoords="offset points", ha="center", fontsize=8, color="dimgray")
     # zaman ekseni
     adim = max(1, (b - a) // 12)
     ax.set_xticks(xs[::adim])
     ax.set_xticklabels([_zaman(t[i]) for i in xs[::adim]], rotation=30, fontsize=7)
-    ax.set_xlim(a - 1, b + 9)
+    ax.set_xlim(a - 1, max(b, son) + 12)
     ax.grid(alpha=0.2)
     yon_ad = "LONG" if yon > 0 else "SHORT"
     bias_ad = {1: "bullish", -1: "bearish", 0: "yok"}[x["bias"]]
-    ax.set_title(f"{x['sembol']} {x['varyant']} | Senaryo {x['senaryo']} ({x['tip']}) | {yon_ad} | "
+    ax.set_title(f"{x['sembol']} | Senaryo {x['senaryo']} | {yon_ad} | "
                  f"giriş {_zaman(x['giris_zaman'])} UTC | bias: {bias_ad}", fontsize=10)
     ax.text(0.01, 0.98,
-            f"stop mesafesi %{x['stop_yuzde']:.3f}   hedef {x['hedef_R']:.2f}R   giriş tipi: {x['giris_tipi']}\n"
+            f"stop mesafesi %{x['stop_yuzde']:.3f}   hedef {x['hedef_R']:.2f}R   FVG genişliği / ATR(14): {x['fvg_atr_orani']:.2f}\n"
             f"FVG {_zaman(t[x['m1']])}–{_zaman(t[x['m3']])}   inversion {_zaman(t[k])}   "
-            f"tetik/dolum {_zaman(t[x['tetik']])}",
+            f"tetik {_zaman(t[x['tetik']])}",
             transform=ax.transAxes, fontsize=8, va="top", bbox=dict(fc="white", alpha=0.8, ec="0.8"))
 
     # günlük panel: bias kontrolü
