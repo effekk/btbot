@@ -23,6 +23,10 @@ import urllib.request
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+try:
+    import bt_tetik; bt_tetik.kontrol()
+except Exception:
+    pass
 
 # =========================================================================
 # AYARLAR
