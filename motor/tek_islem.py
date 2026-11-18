@@ -3,9 +3,8 @@ Tek işlemli backtest motoru (coin başına aynı anda 1 pozisyon).
 
 Mum içi sıra (i mumu):
   1) Açılış: önceki kapanışta seçilen piyasa tetiği varsa giriş değerlendirilir (açılış fiyatı).
-  2) Mum içi: aktif limit emir dolumları (low limitin ALTINA geçmeli).
-     Dolum mumunda stop da görüldüyse stop sayılır, hedef sayılmaz.
-  3) Kapanış: strateji mumu işler, yeni tetikler üretir.
+  2) Kapanış: strateji mumu işler, yeni tetikler üretir.
+(cikis_bul'daki limit_mi seçeneği limit girişli stratejiler için genel olarak duruyor.)
 Çıkış: aynı mumda stop ve hedef varsa önce stop. Hedef limit emirdir: high hedefin
 ÜSTÜNE geçmeli. 48. mum kapanınca sonraki açılışta piyasa emriyle çıkış.
 Stop'ta açılış boşluğu varsa (açılış stopun ötesinde) çıkış açılış fiyatından.
@@ -89,7 +88,8 @@ def calistir(sembol, T, O, H, L, C, gun_bias, varyant, bas_ms, bit_ms, param=Non
         islemler.append({
             "sembol": sembol, "varyant": varyant, "id": k.id, "senaryo": k.senaryo, "tip": k.tip,
             "yon": k.yon, "m1": k.m1, "m3": k.m3, "inv": k.k, "tetik": k.tetik_mum,
-            "geri_cekilme": k.geri_cekilme_mum, "kirilim": k.fiyat(k.kirilim),
+            "tetik_turu": k.tetik_turu, "duzeltme": k.duzeltme_mum, "duzeltme_h": k.fiyat(k.duzeltme_h),
+            "fvg_atr_orani": k.atr_orani,
             "bolge_stop": k.stop, "bolge_giris": k.giris_kenari, "maks3": k.fiyat(k.maks3),
             "e": e, "giris_zaman": T[e], "giris": giris, "giris_tipi": giris_tipi,
             "stop": stop, "hedef": hedef, "hedef_tip": k.hedef_tip,
@@ -119,26 +119,6 @@ def calistir(sembol, T, O, H, L, C, gun_bias, varyant, bas_ms, bit_ms, param=Non
                         dusen[sebep] += 1
                     else:
                         kaydet(k, i, O[i], "piyasa")
-        # 2) mum içi: limit dolumları
-        dolan = st.limit_dolumlari(i)
-        if dolan:
-            aktif = poz is not None and poz["e"] <= i <= poz["aktif_son"]
-            for sira, k in enumerate(dolan):
-                st.kurulum_kaldir(k)
-                if not donemde(t):
-                    continue
-                if aktif or sira > 0:
-                    dusen["pozisyon_acik"] += 1
-                    continue
-                g = t // GUN_MS
-                if st.bias(t) != k.yon:
-                    dusen["bias_uyumsuz"] += 1
-                elif gun_sayac.get(g, 0) >= p["gunluk_max_islem"]:
-                    dusen["gunluk_sinir"] += 1
-                else:
-                    k.tetik_mum = i
-                    kaydet(k, i, k.yon * k.ust, "limit")
-                    aktif = True
         # 3) kapanış
         acik = poz is not None and poz["e"] <= i < poz["x"]
         tetikler = st.mum_kapandi(i)
