@@ -47,7 +47,7 @@ PARAM = {
     "gunluk_swing_n": 2,        # günlük swing: iki yanında 2'şer gün
     "asya_bitis_saat": 8,       # 00:00-08:00 UTC seansı
     "atr_periyot": 14,          # ATR(14), Wilder
-    "fvg_min_atr_k": None,      # FVG genişliği >= k * ATR. k strateji sohbetinde belirlenecek (None = henüz yok)
+    "fvg_min_atr_k": 0.15,      # FVG genişliği >= 0,15 * ATR(14, Wilder, m3 kapanışı); küçükler hiç takip edilmez
 }
 
 VARYANTLAR = {"V1": "Senaryo A + Senaryo B (v2)"}
