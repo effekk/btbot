@@ -41,7 +41,7 @@ SEMBOLLER = ["BTCUSDT", "ETHUSDT"]
 GEL = ("2021-01-01", "2024-06-30")
 DOG = ("2024-07-01", "2026-10-31")
 TOHUM = 20261118
-TOHUM_GRAFIK = 2026111804      # v2 grafikleri için yeni rastgele seçim
+TOHUM_GRAFIK = 2026111804      # v2 grafikleri için yeni rastgele seçim (önceki grafiklerden farklı)
 VARYANT = ["V1"]
 
 
@@ -160,18 +160,27 @@ def mod_grafik():
     sonuc, dv = kos(hazir, VARYANT, bas, bit)
     rng = np.random.default_rng(TOHUM_GRAFIK)
     isl = sonuc["V1"]["islemler"]
-    secilen = []
-    for sen in ("A", "B"):
-        h = [x for x in isl if x["senaryo"] == sen]
-        if h:
-            secilen += [h[i] for i in rng.choice(len(h), size=min(10, len(h)), replace=False)]
+    def sec(havuz, n):
+        if not havuz or n <= 0:
+            return []
+        return [havuz[i] for i in rng.choice(len(havuz), size=min(n, len(havuz)), replace=False)]
+
+    # 10 A; 10 B (en az 4'ü (a) 3 mum tetiği, en az 4'ü (b) düzeltme tetiği, kalan 2 B rastgele)
+    secilen = sec([x for x in isl if x["senaryo"] == "A"], 10)
+    b_a = [x for x in isl if x["senaryo"] == "B" and x["tetik_turu"] == "3mum"]
+    b_b = [x for x in isl if x["senaryo"] == "B" and x["tetik_turu"] == "duzeltme"]
+    secilen_b = sec(b_a, 4) + sec(b_b, 4)
+    kalan = [x for x in b_a + b_b if x not in secilen_b]
+    secilen_b += sec(kalan, 10 - len(secilen_b))
+    secilen += secilen_b
     secilen.sort(key=lambda x: x["giris_zaman"])
     gdir = CIKTI / f"grafik_{time.strftime('%Y%m%d_%H%M')}"
     gdir.mkdir(parents=True, exist_ok=True)
     yollar = []
     for j, x in enumerate(secilen, 1):
         V, G = dv[x["sembol"]]
-        yol = gdir / f"{j:02d}_{x['sembol']}_{x['senaryo']}.png"
+        tur = "" if x["senaryo"] == "A" else ("_a-3mum" if x["tetik_turu"] == "3mum" else "_b-duzeltme")
+        yol = gdir / f"{j:02d}_{x['sembol']}_{x['senaryo']}{tur}.png"
         grafik.kurulum_grafigi(yol, V, G, x, sonuc_goster=False)
         yollar.append(str(yol))
     # kurulum ayrıntıları (sonuç sütunu yok)
@@ -186,6 +195,8 @@ def mod_grafik():
     satir = [f"ifvg_5m {S.SURUM} — KURULUM GRAFİKLERİ (geliştirme dönemi, rastgele {len(secilen)} kurulum)",
              "Sonuçlar gösterilmiyor; grafikler giriş mumunda biter.",
              f"Seçim: A {sum(x['senaryo'] == 'A' for x in secilen)}, B {sum(x['senaryo'] == 'B' for x in secilen)} "
+             f"[(a) 3 mum: {sum(x['senaryo'] == 'B' and x['tetik_turu'] == '3mum' for x in secilen)}, "
+             f"(b) düzeltme: {sum(x['senaryo'] == 'B' and x['tetik_turu'] == 'duzeltme' for x in secilen)}] "
              f"(tohum {TOHUM_GRAFIK}); FVG alt sınırı k = {S.PARAM['fvg_min_atr_k']}", "", veri_mesaji(raporlar), "",
              "Grafikler: turuncu = FVG bölgesi, sarı şerit = m1–m3, mor = inversion ve 3 FVG mumunun uç seviyesi, "
              "mavi = düzeltme mumu ve high/low seviyesi, kare = tetik mumu, yeşil = hedef, kırmızı = stop. "
