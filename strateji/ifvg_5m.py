@@ -14,7 +14,7 @@ Long örneği (bearish FVG):
   Senaryo A  = inversion mumunun açılışı <= bölge altı, değilse Senaryo B
   stop       = bölge altı
 
-Onay bekleyen yorum: ilk tetik kurulumu tüketir; giriş filtresi (bias, stop, 1,5R,
+Netleştirildi: ilk tetik kurulumu tüketir; giriş filtresi (bias, stop, 1,5R,
 günlük sınır, açık pozisyon) geçmezse kurulum düşer, sonraki mumlarda yeniden tetiklenmez.
 """
 from bisect import bisect_left, bisect_right, insort
@@ -38,8 +38,8 @@ PARAM = {
     "swing_n": 2,               # 5m fraktal: iki yanında 2'şer mum
     "gunluk_swing_n": 2,        # günlük swing: iki yanında 2'şer gün
     "asya_bitis_saat": 8,       # 00:00-08:00 UTC seansı
-    # --- strateji sohbetinin onayını bekleyen yorumlar (bkz. mesaj) ---
-    "b_ayni_mum_geri_cekilme": False,  # False: kırılım kapanışı geri çekilme mumundan SONRAKİ bir mumda olmalı
+    # --- strateji sohbetinde netleştirilen yorumlar ---
+    "b_ayni_mum_geri_cekilme": True,   # geri çekilme ve kırılım kapanışı aynı mumda olabilir (iFVG'den red)
 }
 
 VARYANTLAR = {"V1": "Senaryo A + B-piyasa", "V2": "Senaryo A + B-limit"}
