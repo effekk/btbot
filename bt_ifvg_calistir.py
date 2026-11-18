@@ -290,8 +290,46 @@ def analiz(sonuc_v, dv, bas, bit, rng):
             "ort_maliyet_usdt": float(np.mean([x["maliyet_usdt"] for x in isl])) if isl else 0.0,
             "ort_stop_yuzde": float(np.mean([x["stop_yuzde"] for x in isl])) if isl else 0.0,
             "senaryo": {a: sum(x["senaryo"] == a for x in isl) for a in "AB"},
+            "b_tetik": {t: sum(x["senaryo"] == "B" and x["tetik_turu"] == t for x in isl) for t in ("3mum", "duzeltme")},
+            "saglik": saglik_testi(isl, float(max(tut) if tut else 0.0), bas, bit),
             "cikis": {a: sum(x["cikis_tipi"] == a for x in isl) for a in ("stop", "hedef", "sure", "veri_sonu")},
             "dusen": sonuc_v["dusen"]}
+
+
+def saglik_testi(isl, tutarlilik, bas, bit):
+    """Kodun kurallara uyduğunu işlem kayıtları üzerinden denetler. Dönüş: [(ad, ihlal sayısı)]."""
+    p = S.PARAM
+    k_min = p["fvg_min_atr_k"] or 0.0
+    kontroller = {
+        "giriş = tetik mumundan sonraki mum (ileriye bakma yok)": sum(x["e"] != x["tetik"] + 1 for x in isl),
+        "stop doğru tarafta (giriş stopun ötesinde değil)": sum(x["yon"] * (x["giris"] - x["stop"]) <= 0 for x in isl),
+        "hedef doğru tarafta ve ≥ 1,5R": sum(x["yon"] * (x["hedef"] - x["giris"]) <= 0 or x["hedef_R"] < p["min_rr"] - 1e-9
+                                            for x in isl),
+        "stop mesafesi ≥ %0,20": sum(x["stop_yuzde"] < p["min_stop_orani"] * 100 - 1e-9 for x in isl),
+        "işlem yönü = o günün bias'ı": sum(x["bias"] != x["yon"] for x in isl),
+        "inversion m3'ten sonraki 48 mumda": sum(not (1 <= x["inv"] - x["m3"] <= p["fvg_omur"]) for x in isl),
+        "giriş inversion'dan sonraki 48 mumda": sum(not (1 <= x["e"] - x["inv"] <= p["giris_omur"]) for x in isl),
+        "B'de tetik inversion mumunda değil": sum(x["senaryo"] == "B" and x["tetik"] == x["inv"] for x in isl),
+        "B (b): tetik düzeltme mumundan sonra": sum(x["tetik_turu"] == "duzeltme" and not (x["duzeltme"] is not None
+                                                     and x["inv"] < x["duzeltme"] < x["tetik"]) for x in isl),
+        f"FVG genişliği ≥ {k_min} × ATR": sum(not (x["fvg_atr_orani"] >= k_min - 1e-12) for x in isl),
+        "pozisyon süresi ≤ 48 mum": sum(x["x"] - x["e"] > p["pozisyon_omur"] for x in isl),
+        "giriş dönem içinde": sum(not (bas <= x["giris_zaman"] <= bit) for x in isl),
+        "motor = vektörel hesap (karşılaştırmalar aynı kuralla)": int(tutarlilik > 1e-9),
+    }
+    cakisma = gunluk = 0
+    for s_ in SEMBOLLER:
+        xs = sorted((x for x in isl if x["sembol"] == s_), key=lambda x: x["giris_zaman"])
+        for a, b in zip(xs, xs[1:]):
+            cakisma += b["giris_zaman"] < a["cikis_zaman"]
+        sayac = {}
+        for x in xs:
+            g = x["giris_zaman"] // 86_400_000
+            sayac[g] = sayac.get(g, 0) + 1
+        gunluk += sum(v > p["gunluk_max_islem"] for v in sayac.values())
+    kontroller["coin başına aynı anda 1 pozisyon"] = cakisma
+    kontroller["coin başına günde ≤ 4 işlem"] = gunluk
+    return list(kontroller.items())
 
 
 def _f(x, b=2):
@@ -301,7 +339,8 @@ def _f(x, b=2):
 def rapor_metni(v, a, poz, donem_ad):
     oz = a["oz"]
     t = [f"=== {v} ({S.VARYANTLAR[v]}) — {donem_ad} ===",
-         f"İşlem: {oz['n']} (Senaryo A {a['senaryo']['A']}, B {a['senaryo']['B']})"]
+         f"İşlem: {oz['n']} (Senaryo A {a['senaryo']['A']}, B {a['senaryo']['B']}: "
+         f"(a) 3 mum {a['b_tetik']['3mum']}, (b) düzeltme {a['b_tetik']['duzeltme']}) — sadece bilgi"]
     if oz["n"] == 0:
         return "\n".join(t + ["İşlem yok."])
     ok = lambda b: "✅" if b else "❌"  # noqa: E731
@@ -333,7 +372,10 @@ def rapor_metni(v, a, poz, donem_ad):
               f"tasfiye yakın {poz['atlanan']['tasfiye_yakin']}, bakiye yok {poz['atlanan']['bakiye_yok']}",
               f"  Ort. komisyon {poz['ort_komisyon_usdt']:.1f} USDT, son bakiye {poz['son_bakiye']:,.0f} USDT",
               f"  Maks. düşüş %{poz['maks_dusus_yuzde']:.1f}, en uzun zarar serisi {poz['en_uzun_zarar_serisi']}"]
-    t.append(f"(motor/vektör tutarlılık farkı: {a['tutarlilik']:.2e})")
+    ihlal = sum(v for _, v in a["saglik"])
+    t += ["", f"Kod sağlık testi: {'HEPSİ GEÇTİ ✅' if ihlal == 0 else f'{ihlal} İHLAL ❌'}"]
+    t += [f"  {'✅' if v == 0 else '❌ ' + str(v)} {ad}" for ad, v in a["saglik"]]
+    t.append(f"  (motor/vektör en büyük fark: {a['tutarlilik']:.2e})")
     return "\n".join(t)
 
 
@@ -382,7 +424,7 @@ def mod_gelistirme():
     sonuc, dv = kos(hazir, VARYANT, bas, bit)
     metin, an, rdir, dosyalar = sonuc_isle(sonuc, dv, VARYANT, bas, bit, "geliştirme 2021-01 – 2024-06", "gelistirme")
     secilen = "V1" if an["V1"]["gecti"] else None
-    karar_metni = ("\n\nKARAR: tüm kurallar sağlandı → doğrulama açılabilir (IFVG_BT=dogrulama-1)." if secilen
+    karar_metni = ("\n\nKARAR: tüm kurallar sağlandı → doğrulama, onayınla açılabilir (IFVG_BT=dogrulama-1)." if secilen
                    else "\n\nKARAR: kurallar sağlanmadı → doğrulama AÇILMAZ.")
     gecmis = CIKTI / "gelistirme_gecmis.jsonl"
     onceki = [json.loads(s) for s in gecmis.read_text().splitlines()] if gecmis.exists() else []
