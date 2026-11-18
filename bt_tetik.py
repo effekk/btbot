@@ -2,10 +2,10 @@
 ayarlar.env tetikleyicisi: IFVG_BT değeri değişince backtest'i AYRI bir süreçte başlatır.
 
 signal_bot.py her dakika en başta  `import bt_tetik; bt_tetik.kontrol()`  çağırır.
-Değer biçimi:  IFVG_BT=<mod>-<sayı>   (mod: grafik | gelistirme | dogrulama)
+Değer biçimi:  IFVG_BT=<mod>-<sayı>   (mod: oran | grafik | gelistirme | dogrulama)
   Örn. IFVG_BT=grafik-1 ; aynı modu tekrar çalıştırmak için sayıyı artır (grafik-2).
-Backtest systemd-run ile ayrı birim olarak başlar; botun kilidini tutmaz, bot dakikalık
-çalışmasına devam eder. Bir backtest sürerken yeni değer gelirse, o bitince başlar.
+Backtest ayrı bir süreç olarak başlar (root ise systemd-run); botun kilidini tutmaz, bot
+dakikalık çalışmasına devam eder. Servis root değilse sinyalbot.service'te KillMode=process olmalı. Bir backtest sürerken yeni değer gelirse, o bitince başlar.
 """
 import json
 import os
@@ -17,7 +17,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 KOK = REPO.parent
 CIKTI = KOK / "bt_calisma" / "ifvg_5m"
-MODLAR = ("grafik", "gelistirme", "dogrulama")
+MODLAR = ("oran", "grafik", "gelistirme", "dogrulama")
 
 
 def _telegram(metin):
@@ -75,22 +75,27 @@ def _kontrol():
     tetik["son_deger"] = deger
     if mod not in MODLAR:
         tetik_yol.write_text(json.dumps(tetik, ensure_ascii=False, indent=1))
-        _telegram(f"IFVG_BT={deger} tanınmadı. Geçerli: grafik-1, gelistirme-1, dogrulama-1")
+        _telegram(f"IFVG_BT={deger} tanınmadı. Geçerli: oran-1, grafik-1, gelistirme-1, dogrulama-1")
         return
     betik = REPO / "bt_ifvg_calistir.py"
-    birim = f"ifvg-bt-{mod}-{int(time.time())}"
-    komut = ["systemd-run", f"--unit={birim}", "--collect", "--quiet", "--nice=10",
-             "-p", "MemoryMax=700M", f"--working-directory={KOK}", sys.executable, str(betik), mod]
-    yontem = "systemd-run"
-    try:
-        r = subprocess.run(komut, capture_output=True, text=True, timeout=30)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip()[:300])
-    except Exception as ex:
-        yontem = f"yedek (systemd-run olmadı: {ex})"
+    ortam = dict(os.environ, OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+    yontem = "ayrı süreç"
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        # root ise systemd-run (bellek sınırı 700 MB); değilse doğrudan ayrı süreç.
+        # Ayrı süreç yönteminin servis bitince öldürülmemesi için sinyalbot.service'te KillMode=process gerekir.
+        birim = f"ifvg-bt-{mod}-{int(time.time())}"
+        komut = ["systemd-run", f"--unit={birim}", "--collect", "--quiet", "--nice=10",
+                 "-p", "MemoryMax=700M", f"--working-directory={KOK}", sys.executable, str(betik), mod]
+        try:
+            r = subprocess.run(komut, capture_output=True, text=True, timeout=30)
+            yontem = "systemd-run" if r.returncode == 0 else ""
+        except Exception:
+            yontem = ""
+    if yontem != "systemd-run":
         log = open(CIKTI / "arka_plan.log", "a")
-        subprocess.Popen([sys.executable, str(betik), mod], cwd=str(KOK), stdout=log, stderr=log,
+        subprocess.Popen([sys.executable, str(betik), mod], cwd=str(KOK), stdout=log, stderr=log, env=ortam,
                          stdin=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        yontem = "ayrı süreç"
     tetik["baslatma_zamani"] = time.time()
     tetik["mod"] = mod
     tetik_yol.write_text(json.dumps(tetik, ensure_ascii=False, indent=1))
