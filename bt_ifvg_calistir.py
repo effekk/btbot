@@ -1,11 +1,12 @@
 """
 ifvg_5m backtest çalıştırıcısı (sunucuda, arka planda; bt_tetik.py başlatır).
 
-Kullanım:  python bt_ifvg_calistir.py grafik|gelistirme|dogrulama
+Kullanım:  python bt_ifvg_calistir.py oran|grafik|gelistirme|dogrulama
 
-  grafik      : geliştirme döneminden rastgele 20 kurulum grafiği (sonuç YOK)
-  gelistirme  : V1 ve V2 geliştirme sonuçları + karar kuralları
-  dogrulama   : sadece geliştirmede geçen tek varyant, bir kez
+  oran        : son grafik çalıştırmasındaki kurulumların FVG genişliği / ATR(14) tablosu (sonuç YOK)
+  grafik      : geliştirme döneminden rastgele 20 kurulum grafiği (sonuç YOK, grafik girişte biter)
+  gelistirme  : geliştirme sonuçları + karar kuralları
+  dogrulama   : geliştirmede geçtiyse, bir kez
 Çıktılar: /opt/sinyalbot/bt_calisma/ifvg_5m/
 """
 import csv
@@ -22,6 +23,12 @@ KOK = REPO.parent
 BT = KOK / "bt_calisma"
 CIKTI = BT / "ifvg_5m"
 os.environ.setdefault("MPLCONFIGDIR", str(CIKTI / ".matplotlib"))
+for _d in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_d, "1")      # tek iş parçacığı: daha az bellek
+try:
+    os.nice(10)                         # botun önüne geçmesin
+except Exception:
+    pass
 sys.path.insert(0, str(REPO))
 
 import numpy as np  # noqa: E402
@@ -34,6 +41,16 @@ SEMBOLLER = ["BTCUSDT", "ETHUSDT"]
 GEL = ("2021-01-01", "2024-06-30")
 DOG = ("2024-07-01", "2026-10-31")
 TOHUM = 20261118
+TOHUM_GRAFIK = 2026111804      # v2 grafikleri için yeni rastgele seçim
+VARYANT = ["V1"]
+
+
+def k_hazir():
+    if S.PARAM["fvg_min_atr_k"] is None:
+        telegram.mesaj("ifvg_5m: FVG alt sınırı k henüz belirlenmedi (strateji/ifvg_5m.py, fvg_min_atr_k). "
+                       "Çalıştırma yapılmadı.")
+        return False
+    return True
 
 
 def env_yukle():
@@ -136,49 +153,92 @@ def veri_mesaji(raporlar):
 
 # ---------------------------------------------------------------------------
 def mod_grafik():
+    if not k_hazir():
+        return
     hazir, raporlar = veri_hazirla()
     bas, bit = ms(GEL[0]), ms(GEL[1], True)
-    sonuc, dv = kos(hazir, ["V1", "V2"], bas, bit)
-    rng = np.random.default_rng(TOHUM)
-    havuz = {
-        "A": [x for x in sonuc["V1"]["islemler"] if x["senaryo"] == "A"],
-        "B-piyasa": [x for x in sonuc["V1"]["islemler"] if x["tip"] == "B-piyasa"],
-        "B-limit": [x for x in sonuc["V2"]["islemler"] if x["tip"] == "B-limit"],
-    }
-    hedef_adet = {"A": 7, "B-piyasa": 7, "B-limit": 6}
+    sonuc, dv = kos(hazir, VARYANT, bas, bit)
+    rng = np.random.default_rng(TOHUM_GRAFIK)
+    isl = sonuc["V1"]["islemler"]
     secilen = []
-    for ad, n in hedef_adet.items():
-        h = havuz[ad]
+    for sen in ("A", "B"):
+        h = [x for x in isl if x["senaryo"] == sen]
         if h:
-            secilen += [h[i] for i in rng.choice(len(h), size=min(n, len(h)), replace=False)]
+            secilen += [h[i] for i in rng.choice(len(h), size=min(10, len(h)), replace=False)]
     secilen.sort(key=lambda x: x["giris_zaman"])
     gdir = CIKTI / f"grafik_{time.strftime('%Y%m%d_%H%M')}"
     gdir.mkdir(parents=True, exist_ok=True)
     yollar = []
     for j, x in enumerate(secilen, 1):
         V, G = dv[x["sembol"]]
-        yol = gdir / f"{j:02d}_{x['sembol']}_{x['varyant']}_{x['tip']}.png"
-        grafik.kurulum_grafigi(yol, V, G, x, None)
+        yol = gdir / f"{j:02d}_{x['sembol']}_{x['senaryo']}.png"
+        grafik.kurulum_grafigi(yol, V, G, x, sonuc_goster=False)
         yollar.append(str(yol))
-    # kurulum ayrıntıları (sonuç sütunları yok)
-    alanlar = ["sembol", "varyant", "tip", "yon", "bias", "m1", "m3", "inv", "geri_cekilme", "kirilim", "tetik", "e",
-               "giris_tipi", "giris", "stop", "hedef", "hedef_tip", "hedef_R", "stop_yuzde", "cikis_tipi"]
+    # kurulum ayrıntıları (sonuç sütunu yok)
+    alanlar = ["sembol", "senaryo", "yon", "bias", "m1", "m3", "inv", "duzeltme", "duzeltme_h", "tetik", "tetik_turu",
+               "e", "giris", "stop", "hedef", "hedef_tip", "hedef_R", "stop_yuzde", "fvg_atr_orani"]
     with open(gdir / "kurulumlar.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(alanlar + ["giris_utc", "inversion_utc"])
         for x in secilen:
             V = dv[x["sembol"]][0]
             w.writerow([x[a] for a in alanlar] + [veri._tarih(x["giris_zaman"]), veri._tarih(V["t"][x["inv"]])])
-    satir = [f"ifvg_5m v1 — KURULUM GRAFİKLERİ (geliştirme dönemi, rastgele {len(secilen)} kurulum)",
-             "Sonuçlar gösterilmiyor; önce kuralların doğru kodlandığını onayla.",
-             f"Seçim: A {sum(x['senaryo'] == 'A' for x in secilen)}, B-piyasa "
-             f"{sum(x['tip'] == 'B-piyasa' for x in secilen)}, B-limit {sum(x['tip'] == 'B-limit' for x in secilen)} "
-             f"(her yol kontrol edilsin diye; tohum {TOHUM})", "", veri_mesaji(raporlar), "",
-             "Grafikler: turuncu = FVG bölgesi, sarı şerit = m1–m3, mor = inversion/A tetik seviyesi, "
-             "mavi = geri çekilme/kırılım, yeşil = hedef, kırmızı = stop, X = çıkış. Sağ panel: günlük bias."]
+    satir = [f"ifvg_5m {S.SURUM} — KURULUM GRAFİKLERİ (geliştirme dönemi, rastgele {len(secilen)} kurulum)",
+             "Sonuçlar gösterilmiyor; grafikler giriş mumunda biter.",
+             f"Seçim: A {sum(x['senaryo'] == 'A' for x in secilen)}, B {sum(x['senaryo'] == 'B' for x in secilen)} "
+             f"(tohum {TOHUM_GRAFIK}); FVG alt sınırı k = {S.PARAM['fvg_min_atr_k']}", "", veri_mesaji(raporlar), "",
+             "Grafikler: turuncu = FVG bölgesi, sarı şerit = m1–m3, mor = inversion ve 3 FVG mumunun uç seviyesi, "
+             "mavi = düzeltme mumu ve high/low seviyesi, kare = tetik mumu, yeşil = hedef, kırmızı = stop. "
+             "Sağ panel: günlük bias."]
     telegram.mesaj("\n".join(satir))
-    telegram.resimler(yollar, "ifvg_5m kurulumlar")
+    telegram.resimler(yollar, f"ifvg_5m {S.SURUM} kurulumlar")
     telegram.dosya(gdir / "kurulumlar.csv", "Kurulum ayrıntıları (sonuç sütunu yok)")
+
+
+def mod_oran():
+    """Son grafik çalıştırmasındaki kurulumlar için FVG genişliği / ATR(14, Wilder, m3 kapanışı)."""
+    adaylar = sorted(CIKTI.glob("grafik_*/kurulumlar.csv"))
+    if not adaylar:
+        telegram.mesaj("ifvg_5m oran: grafik klasörü bulunamadı.")
+        return
+    yol = adaylar[-1]
+    with open(yol, encoding="utf-8") as f:
+        satirlar = list(csv.DictReader(f))
+    hazir, _ = veri_hazirla()
+    bit = ms(GEL[1], True)
+    veriler = {}
+    for s in {r["sembol"] for r in satirlar}:
+        V, _, _ = donem_verisi(hazir[s], bit)
+        veriler[s] = (V, S.atr_wilder(V["h"], V["l"], V["c"], S.PARAM["atr_periyot"]))
+    tablo = []
+    for r in satirlar:
+        V, atr = veriler[r["sembol"]]
+        m1, m3, yon = int(r["m1"]), int(r["m3"]), int(r["yon"])
+        if yon > 0:   # bearish FVG: alt = m3.high, üst = m1.low
+            alt, ust = V["h"][m3], V["l"][m1]
+        else:         # bullish FVG: alt = m1.high, üst = m3.low
+            alt, ust = V["h"][m1], V["l"][m3]
+        uzak = alt if yon > 0 else ust
+        eslesme = abs(uzak - float(r["stop"])) <= 1e-6 * abs(uzak)
+        sen = "A" if r.get("tip", r.get("senaryo")) == "A" else f"B ({r.get('tip', 'B')})"
+        tablo.append({"sembol": r["sembol"], "m3_utc": veri._tarih(V["t"][m3]), "senaryo": sen,
+                      "genislik": ust - alt, "atr14": atr[m3], "oran": (ust - alt) / atr[m3],
+                      "kontrol": "ok" if eslesme else "UYUŞMADI"})
+    tablo.sort(key=lambda x: x["m3_utc"])
+    cikti = yol.parent / "fvg_atr_oranlari.csv"
+    with open(cikti, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(tablo[0].keys()))
+        w.writeheader()
+        w.writerows(tablo)
+    oranlar = np.array([x["oran"] for x in tablo])
+    metin = [f"ifvg_5m — FVG genişliği / ATR(14, Wilder, m3 kapanışı) — {yol.parent.name} ({len(tablo)} kurulum)",
+             "Sonuç sütunu yok.", "", "sembol | m3 (UTC) | senaryo | oran"]
+    metin += [f"{x['sembol'][:3]} | {x['m3_utc']} | {x['senaryo']} | {x['oran']:.2f}"
+              + ("" if x["kontrol"] == "ok" else " ⚠️ stop eşleşmedi") for x in tablo]
+    metin += ["", f"Dağılım: en düşük {oranlar.min():.2f}, %25 {np.percentile(oranlar, 25):.2f}, "
+                  f"medyan {np.median(oranlar):.2f}, %75 {np.percentile(oranlar, 75):.2f}, en yüksek {oranlar.max():.2f}"]
+    telegram.mesaj("\n".join(metin))
+    telegram.dosya(cikti, "FVG/ATR oranları")
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +354,7 @@ def sonuc_isle(sonuc, dv, varyantlar, bas, bit, donem_ad, etiket):
             grafik.ozsermaye_grafigi(rdir / f"ozsermaye_{v}.png", poz["egri_t"], poz["egri"],
                                      f"ifvg_5m {v} — {donem_ad} — özsermaye (USDT)")
             dosyalar.append(rdir / f"ozsermaye_{v}.png")
-    bas_satir = [f"ifvg_5m v1 — {donem_ad} SONUÇLARI", f"Kural özeti (hash): {kural_ozeti()}",
+    bas_satir = [f"ifvg_5m {S.SURUM} — {donem_ad} SONUÇLARI", f"Kural özeti (hash): {kural_ozeti()}", f"FVG alt sınırı k = {S.PARAM['fvg_min_atr_k']} × ATR(14)",
                  f"Maliyet: taker %{MALIYET['taker'] * 100:.2f}+kayma %{MALIYET['kayma'] * 100:.2f}, "
                  f"maker %{MALIYET['maker'] * 100:.2f}, funding %{MALIYET['funding_8s'] * 100:.2f}/8s",
                  f"Leverage bracket: {br_kaynak}"]
@@ -304,14 +364,15 @@ def sonuc_isle(sonuc, dv, varyantlar, bas, bit, donem_ad, etiket):
 
 
 def mod_gelistirme():
+    if not k_hazir():
+        return
     hazir, raporlar = veri_hazirla()
     bas, bit = ms(GEL[0]), ms(GEL[1], True)
-    sonuc, dv = kos(hazir, ["V1", "V2"], bas, bit)
-    metin, an, rdir, dosyalar = sonuc_isle(sonuc, dv, ["V1", "V2"], bas, bit, "geliştirme 2021-01 – 2024-06", "gelistirme")
-    gecen = [v for v in ("V1", "V2") if an[v]["gecti"]]
-    secilen = max(gecen, key=lambda v: an[v]["oz"]["ort_R"]) if gecen else None
-    karar_metni = (f"\n\nSEÇİM: {secilen} doğrulamaya gider (geçenler: {', '.join(gecen)})." if secilen
-                   else "\n\nSEÇİM: hiçbir varyant geçmedi → doğrulama AÇILMAZ.")
+    sonuc, dv = kos(hazir, VARYANT, bas, bit)
+    metin, an, rdir, dosyalar = sonuc_isle(sonuc, dv, VARYANT, bas, bit, "geliştirme 2021-01 – 2024-06", "gelistirme")
+    secilen = "V1" if an["V1"]["gecti"] else None
+    karar_metni = ("\n\nKARAR: tüm kurallar sağlandı → doğrulama açılabilir (IFVG_BT=dogrulama-1)." if secilen
+                   else "\n\nKARAR: kurallar sağlanmadı → doğrulama AÇILMAZ.")
     gecmis = CIKTI / "gelistirme_gecmis.jsonl"
     onceki = [json.loads(s) for s in gecmis.read_text().splitlines()] if gecmis.exists() else []
     if onceki and onceki[-1]["hash"] != kural_ozeti():
@@ -340,7 +401,7 @@ def mod_dogrulama():
         return
     gs = json.loads(sonuc_yol.read_text())
     if not gs.get("secilen"):
-        telegram.mesaj("ifvg_5m: geliştirmede hiçbir varyant geçmedi. Doğrulama açılmaz.")
+        telegram.mesaj("ifvg_5m: geliştirme kuralları sağlanmadı. Doğrulama açılmaz.")
         return
     if gs["hash"] != kural_ozeti():
         telegram.mesaj("ifvg_5m: kural dosyaları geliştirme çalıştırmasından sonra değişmiş. Doğrulama açılmadı.")
@@ -368,7 +429,7 @@ def main():
     durum_yaz(mod=mod, pid=os.getpid(), durum="calisiyor", basla=time.strftime("%Y-%m-%d %H:%M:%S"))
     t0 = time.time()
     try:
-        {"grafik": mod_grafik, "gelistirme": mod_gelistirme, "dogrulama": mod_dogrulama}[mod]()
+        {"oran": mod_oran, "grafik": mod_grafik, "gelistirme": mod_gelistirme, "dogrulama": mod_dogrulama}[mod]()
         durum_yaz(durum="bitti", bitis=time.strftime("%Y-%m-%d %H:%M:%S"))
         log(f"bitti ({(time.time() - t0) / 60:.1f} dk)")
     except Exception as ex:
